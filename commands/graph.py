@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Graph command - Build Obsidian notes from paper knowledge graph."""
+import logging
 import typer
 import json
 import sys
@@ -10,8 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
-from alphaxiv_cli.overview_generator import ensure_overview_generated, is_playwright_available
+logger = logging.getLogger(__name__)
+
+from client import AlphaXivClient, AlphaXivError
+from overview_generator import ensure_overview_generated, is_playwright_available
+from utils.helpers import extract_version_id
 
 app = typer.Typer(name="graph", help="Build Obsidian knowledge graph")
 
@@ -29,7 +33,6 @@ def main(
     headless: bool = typer.Option(False, "--headless/--no-headless", help="Run Playwright in headless mode (default: visible browser)"),
 ):
     """Build Obsidian notes with paper connections."""
-    client = AlphaXivClient()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
@@ -39,30 +42,29 @@ def main(
     db = load_db(db_file)
     
     try:
-        info = client.resolve_paper(paper_id)
-        if not info:
-            print(f"Error: Paper not found: {paper_id}", file=sys.stderr)
-            raise typer.Exit(1)
-        
-        title = info.get("title", "Unknown")
-        
-        print(f"Building knowledge graph: {title}")
-        print(f"Output: {output_dir}")
-        print(f"Iterations: {iterations}, Limit: {limit}\n")
-        
-        count = build_graph(
-            client, paper_id, output_path, reports_dir, images_dir,
-            db, db_file, iterations, limit, verbose, download_images,
-            generate_missing, Path(secret_file) if secret_file else None, headless
-        )
-        
-        print(f"\n✓ Generated {count} paper notes")
-        
+        with AlphaXivClient() as client:
+            info = client.resolve_paper(paper_id)
+            if not info:
+                print(f"Error: Paper not found: {paper_id}", file=sys.stderr)
+                raise typer.Exit(1)
+            
+            title = info.get("title", "Unknown")
+            
+            print(f"Building knowledge graph: {title}")
+            print(f"Output: {output_dir}")
+            print(f"Iterations: {iterations}, Limit: {limit}\n")
+            
+            count = build_graph(
+                client, paper_id, output_path, reports_dir, images_dir,
+                db, db_file, iterations, limit, verbose, download_images,
+                generate_missing, Path(secret_file) if secret_file else None, headless
+            )
+            
+            print(f"\n✓ Generated {count} paper notes")
+            
     except AlphaXivError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise typer.Exit(1)
-    finally:
-        client.close()
 
 
 def load_db(db_file: Path) -> dict:
@@ -87,8 +89,10 @@ def get_arxiv_categories(paper_id: str) -> list:
                 if c.startswith(('math.', 'physics.', 'cs.', 'stat.', 'q-bio.', 'q-fin.', 'econ.')):
                     filtered.append(c.replace('.', '-'))
             return filtered
-    except:
-        pass
+    except httpx.RequestError as e:
+        logger.warning(f"Failed to fetch arXiv categories for {paper_id}: {e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error fetching arXiv categories for {paper_id}: {e}")
     return []
 
 
@@ -118,28 +122,62 @@ def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path
     if not matches:
         return markdown
     
-    paper_images_dir = images_dir / paper_id
+    safe_id = sanitize_paper_id(paper_id)
+    paper_images_dir = images_dir / safe_id
+    
+    if not paper_images_dir.resolve().is_relative_to(images_dir.resolve()):
+        print(f"    WARNING: Path traversal attempt blocked for {paper_id}")
+        return markdown
+    
     paper_images_dir.mkdir(parents=True, exist_ok=True)
     
     for alt_text, url in matches:
         if url.startswith('http'):
             try:
-                resp = httpx.get(url, timeout=30)
+                resp = httpx.get(url, timeout=30, follow_redirects=True)
                 if resp.status_code == 200:
-                    ext = Path(url).suffix or '.png'
+                    content_type = resp.headers.get('content-type', '').lower()
+                    
+                    if not content_type.startswith('image/'):
+                        print(f"    Skipping non-image content: {content_type}")
+                        continue
+                    
+                    if len(resp.content) > 10 * 1024 * 1024:
+                        print(f"    Skipping large image (>10MB)")
+                        continue
+                    
+                    ext_map = {
+                        'image/jpeg': '.jpeg',
+                        'image/jpg': '.jpg',
+                        'image/png': '.png',
+                        'image/gif': '.gif',
+                        'image/webp': '.webp',
+                        'image/svg+xml': '.svg',
+                    }
+                    ext = ext_map.get(content_type, Path(url).suffix or '.png')
+                    
                     safe_name = re.sub(r'[^\w\-]', '_', alt_text[:30]) if alt_text else f"img_{hash(url) % 10000}"
                     filename = f"{safe_name}{ext}"
                     img_path = paper_images_dir / filename
                     
+                    if not img_path.resolve().is_relative_to(paper_images_dir.resolve()):
+                        print(f"    WARNING: Path traversal blocked for filename: {filename}")
+                        continue
+                    
                     img_path.write_bytes(resp.content)
                     
-                    local_path = f"./images/{paper_id}/{filename}"
+                    local_path = f"./images/{safe_id}/{filename}"
                     markdown = markdown.replace(url, local_path)
                     print(f"    Downloaded image: {filename}")
             except Exception as e:
                 print(f"    Failed to download image: {e}")
     
     return markdown
+
+
+def sanitize_paper_id(paper_id: str) -> str:
+    safe_id = re.sub(r'[^\w\-\.]', '_', paper_id)
+    return safe_id[:255]
 
 
 def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_file, iterations, limit, verbose, download_imgs, generate_missing=False, secret_path=None, headless=True):
@@ -184,7 +222,7 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                     progress.advance(task)
                     continue
                 
-                version_id = info.get("versionId") or info.get("version_id")
+                version_id = extract_version_id(info)
                 if not version_id:
                     progress.advance(task)
                     continue
@@ -203,7 +241,8 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                         if ensure_overview_generated(paper_id, version_id, client, secret_path, headless):
                             try:
                                 overview = client.get_overview(version_id)
-                            except:
+                            except Exception as e:
+                                logger.warning(f"Failed to fetch overview after generation for {paper_id}: {e}")
                                 overview = None
                 
                 if not overview or not overview.get('overview'):
@@ -216,20 +255,30 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                 
                 note, report = build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs)
                 
-                note_path = output_dir / f"{paper_id}.md"
+                safe_id = sanitize_paper_id(paper_id)
+                note_path = output_dir / f"{safe_id}.md"
+                
+                if not note_path.resolve().is_relative_to(output_dir.resolve()):
+                    raise ValueError(f"Path traversal detected: {paper_id}")
+                
                 note_path.write_text(note)
                 
                 if report:
                     reports_dir.mkdir(parents=True, exist_ok=True)
-                    report_path = reports_dir / f"{paper_id}_report.md"
+                    report_path = reports_dir / f"{safe_id}_report.md"
+                    
+                    if not report_path.resolve().is_relative_to(reports_dir.resolve()):
+                        raise ValueError(f"Path traversal detected in report: {paper_id}")
+                    
                     report_path.write_text(report)
                     if verbose:
                         print(f"  Created intermediate report: {paper_id}_report.md")
                 
                 db[paper_id] = {"title": info.get("title", ""), "processed": True, "date": today}
-                save_db(db_file, db)
-                
                 processed += 1
+                
+                if processed % 10 == 0:
+                    save_db(db_file, db)
                 
                 if depth < iterations - 1:
                     for sp in similar[:limit]:
@@ -244,6 +293,7 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
             queue = new_queue
             iteration += 1
     
+    save_db(db_file, db)
     return processed
 
 
