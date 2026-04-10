@@ -1,9 +1,12 @@
 """Storage utilities - Caching and database."""
 import json
+import logging
 import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
 
 
 class Cache:
@@ -33,7 +36,18 @@ class Cache:
                 return None
             
             return data['value']
-        except:
+        except json.JSONDecodeError as e:
+            logger.warning(f"Corrupted cache file {cache_path}, removing: {e}")
+            try:
+                cache_path.unlink()
+            except OSError:
+                pass
+            return None
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Invalid cache data in {cache_path}: {e}")
+            return None
+        except OSError as e:
+            logger.warning(f"Failed to read cache file {cache_path}: {e}")
             return None
     
     def set(self, key: str, value: Any):
