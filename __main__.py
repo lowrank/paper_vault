@@ -6,8 +6,8 @@ import sys
 from typing import Optional
 from pathlib import Path
 
-from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
-from alphaxiv_cli.commands import get_cmd, similar_cmd, explore_cmd, graph_cmd
+from client import AlphaXivClient, AlphaXivError
+from commands import get_cmd, similar_cmd, explore_cmd, graph_cmd
 
 app = typer.Typer(
     name="axiv",
@@ -50,7 +50,7 @@ def search(
 @app.command()
 def version():
     """Show version."""
-    from alphaxiv_cli import __version__
+    from __init__ import __version__
     print(f"alphaxiv-cli {__version__}")
 
 
