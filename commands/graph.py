@@ -120,15 +120,21 @@ _STOPWORDS = {
 
 def _keywords_from_text(title: str, summary: str) -> list:
     import re as _re
-    combined = f"{title} {summary}"
-    tokens = _re.findall(r'\b[A-Za-z][a-z]{2,}\b', combined)
+    combined = f"{title}. {summary}"
+    words = _re.findall(r'\b[A-Za-z][a-z]{2,}\b', combined)
+    
+    bigrams = []
+    for i in range(len(words) - 1):
+        w1, w2 = words[i].lower(), words[i+1].lower()
+        if w1 not in _STOPWORDS and w2 not in _STOPWORDS:
+            bigrams.append(f"{words[i]} {words[i+1]}")
+    
     freq: dict = {}
-    for t in tokens:
-        low = t.lower()
-        if low not in _STOPWORDS and len(low) > 3:
-            freq[low] = freq.get(low, 0) + 1
+    for bg in bigrams:
+        freq[bg] = freq.get(bg, 0) + 1
+    
     ranked = sorted(freq, key=lambda k: -freq[k])
-    return ranked[:10]
+    return ranked[:10] if ranked else [w for w in words if w.lower() not in _STOPWORDS and len(w) > 4][:10]
 
 
 def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path) -> str:
