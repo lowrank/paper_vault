@@ -337,7 +337,7 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                     cited_id = c.get("arxivId") or c.get("arxiv_id") or c.get("paper_id")
                     if cited_id:
                         add_citation_triple(paper_id, cited_id, KG_PATH)
-                for topic in categories[:5]:
+                for topic in extract_keywords(overview, info)[:5]:
                     add_topic_triple(paper_id, topic, KG_PATH)
                 
                 if processed % 10 == 0:
