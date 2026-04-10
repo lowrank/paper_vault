@@ -81,19 +81,50 @@ def save_db(db_file: Path, db: dict):
 
 
 def extract_keywords(overview: Optional[dict], paper_info: Optional[dict] = None) -> list:
-    """Extract keywords from overview and paper info."""
     topics = []
-    if paper_info and 'topics' in paper_info:
-        topics.extend(paper_info.get('topics', []))
+    if paper_info:
+        raw = paper_info.get('topics')
+        if isinstance(raw, list):
+            topics.extend(raw)
     if overview:
-        if 'topics' in overview:
-            topics.extend(overview.get('topics', []))
-        ai_tooltips = overview.get('aiTooltips', [])
-        if ai_tooltips:
+        raw = overview.get('topics')
+        if isinstance(raw, list):
+            topics.extend(raw)
+        ai_tooltips = overview.get('aiTooltips')
+        if isinstance(ai_tooltips, list):
             for tip in ai_tooltips:
                 if isinstance(tip, dict) and 'name' in tip:
                     topics.append(tip['name'])
-    return list(set(topics))[:10]
+    if not topics:
+        topics = _keywords_from_text(
+            (paper_info or {}).get('title', ''),
+            ((overview or {}).get('summary') or {}).get('summary', '') if isinstance((overview or {}).get('summary'), dict) else '',
+        )
+    return list(dict.fromkeys(t for t in topics if t))[:10]
+
+
+_STOPWORDS = {
+    'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'and',
+    'or', 'is', 'are', 'was', 'be', 'by', 'as', 'from', 'that', 'this',
+    'it', 'its', 'we', 'our', 'their', 'which', 'both', 'also', 'can',
+    'has', 'have', 'been', 'into', 'not', 'such', 'well', 'under',
+    'paper', 'work', 'study', 'research', 'approach', 'method', 'model',
+    'based', 'show', 'using', 'used', 'propose', 'proposed',
+    'university', 'researchers', 'authors', 'establishes', 'demonstrates',
+    'provides', 'present', 'presents', 'results', 'data', 'problems',
+}
+
+def _keywords_from_text(title: str, summary: str) -> list:
+    import re as _re
+    combined = f"{title} {summary}"
+    tokens = _re.findall(r'\b[A-Za-z][a-z]{2,}\b', combined)
+    freq: dict = {}
+    for t in tokens:
+        low = t.lower()
+        if low not in _STOPWORDS and len(low) > 3:
+            freq[low] = freq.get(low, 0) + 1
+    ranked = sorted(freq, key=lambda k: -freq[k])
+    return ranked[:10]
 
 
 def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path) -> str:
