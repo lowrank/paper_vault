@@ -224,9 +224,6 @@ def ensure_overview_generated(paper_id: str, version_id: str, client, secret_fil
     except Exception as e:
         print(f"    ✗ Overview generation failed: {e}")
         return False
-    finally:
-        if context:
-            context.close()
 
 
 def is_playwright_available() -> bool:

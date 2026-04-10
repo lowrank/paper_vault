@@ -285,11 +285,19 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                         if verbose:
                             print(f"  Attempting to generate overview for {paper_id}...")
                         if ensure_overview_generated(paper_id, version_id, client, secret_path, headless):
-                            try:
-                                overview = client.get_overview(version_id)
-                            except Exception as e2:
-                                logger.warning(f"Failed to fetch overview after generation for {paper_id}: {e2}")
-                                overview = None
+                            import time
+                            for retry in range(5):
+                                try:
+                                    overview = client.get_overview(version_id, use_cache=False)
+                                    if overview and overview.get('overview'):
+                                        break
+                                    time.sleep(2)
+                                except AlphaXivError as e2:
+                                    if '404' not in str(e2) or retry >= 4:
+                                        logger.warning(f"Failed to fetch overview after generation for {paper_id}: {e2}")
+                                        overview = None
+                                        break
+                                    time.sleep(2)
                     
                     if not overview or not overview.get('overview'):
                         pending[paper_id] = {

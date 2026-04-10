@@ -91,10 +91,10 @@ class AlphaXivClient:
         
         return response.json()
     
-    def get_overview(self, version_id: str, language: str = "en") -> Optional[Dict[str, Any]]:
+    def get_overview(self, version_id: str, language: str = "en", use_cache: bool = True) -> Optional[Dict[str, Any]]:
         """Fetch paper overview (AI-generated summary)."""
         url = f"{BASE_API_URL}/papers/v3/{version_id}/overview/{language}"
-        response = self._request("GET", url)
+        response = self._request("GET", url, use_cache=use_cache)
         
         if response.status_code == 404:
             return None
