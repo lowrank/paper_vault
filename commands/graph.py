@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 from client import AlphaXivClient, AlphaXivError
 from overview_generator import ensure_overview_generated, is_playwright_available
 from utils.helpers import extract_version_id
+from config import PALACE_PATH, KG_PATH
+from storage.memory import upsert_paper, add_citation_triple, add_topic_triple
 
 app = typer.Typer(name="graph", help="Build Obsidian knowledge graph")
 
@@ -276,6 +278,14 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                 
                 db[paper_id] = {"title": info.get("title", ""), "processed": True, "date": today}
                 processed += 1
+                
+                upsert_paper(paper_id, info, overview, PALACE_PATH)
+                for c in overview.get("citations", []):
+                    cited_id = c.get("arxivId") or c.get("arxiv_id") or c.get("paper_id")
+                    if cited_id:
+                        add_citation_triple(paper_id, cited_id, KG_PATH)
+                for topic in extract_keywords(overview, info)[:5]:
+                    add_topic_triple(paper_id, topic, KG_PATH)
                 
                 if processed % 10 == 0:
                     save_db(db_file, db)
