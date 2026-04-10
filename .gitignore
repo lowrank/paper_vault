@@ -1,0 +1,40 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# AlphaXiv CLI outputs
+output/
+test_output/
+.cache/
+
+# Credentials (NEVER commit!)
+SECRET.md
+.env
+
+# Browser automation
+.alphaxiv/browser-profile-login/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
