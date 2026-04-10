@@ -14,7 +14,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 logger = logging.getLogger(__name__)
 
 from client import AlphaXivClient, AlphaXivError
-from overview_generator import ensure_overview_generated, is_playwright_available
+from overview_generator import ensure_overview_generated, load_credentials
 from utils.helpers import extract_version_id
 from config import PALACE_PATH, KG_PATH
 from storage.memory import upsert_paper, add_citation_triple, add_topic_triple
@@ -30,7 +30,6 @@ def main(
     limit: int = typer.Option(5, "--limit", "-l", help="Similar papers per paper"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     download_images: bool = typer.Option(False, "--images", help="Download images from overview"),
-    generate_missing: bool = typer.Option(False, "--generate", "-g", help="Auto-generate missing overviews (requires Playwright + credentials)"),
     secret_file: Optional[str] = typer.Option(None, "--secret", help="Path to SECRET.md with credentials"),
     headless: bool = typer.Option(False, "--headless/--no-headless", help="Run Playwright in headless mode (default: visible browser)"),
 ):
@@ -56,13 +55,15 @@ def main(
             print(f"Output: {output_dir}")
             print(f"Iterations: {iterations}, Limit: {limit}\n")
             
-            count = build_graph(
+            count, pending = build_graph(
                 client, paper_id, output_path, reports_dir, images_dir,
                 db, db_file, iterations, limit, verbose, download_images,
-                generate_missing, Path(secret_file) if secret_file else None, headless
+                Path(secret_file) if secret_file else None, headless
             )
             
             print(f"\n✓ Generated {count} paper notes")
+            if pending:
+                print(f"  {pending} paper(s) skipped — see {output_dir}/pending_generation.json")
             
     except AlphaXivError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -182,12 +183,17 @@ def sanitize_paper_id(paper_id: str) -> str:
     return safe_id[:255]
 
 
-def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_file, iterations, limit, verbose, download_imgs, generate_missing=False, secret_path=None, headless=True):
+def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_file, iterations, limit, verbose, download_imgs, secret_path=None, headless=True):
     """Build knowledge graph with BFS traversal."""
     queue = deque([(start_id, 0, None)])
     processed = 0
     iteration = 0
     today = datetime.now().strftime("%Y-%m-%d")
+    pending_file = output_dir / "pending_generation.json"
+    pending = load_db(pending_file)
+
+    credentials = load_credentials(secret_path)
+    has_credentials = bool(credentials[0] and credentials[1])
     
     with Progress(
         SpinnerColumn(),
@@ -236,16 +242,23 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                         print(f"  No overview for {paper_id}: {e}")
                     overview = None
                     
-                    # Try to generate overview if flag is set
-                    if generate_missing and overview is None:
+                    if has_credentials:
                         if verbose:
                             print(f"  Attempting to generate overview for {paper_id}...")
                         if ensure_overview_generated(paper_id, version_id, client, secret_path, headless):
                             try:
                                 overview = client.get_overview(version_id)
-                            except Exception as e:
-                                logger.warning(f"Failed to fetch overview after generation for {paper_id}: {e}")
+                            except Exception as e2:
+                                logger.warning(f"Failed to fetch overview after generation for {paper_id}: {e2}")
                                 overview = None
+                    
+                    if not overview or not overview.get('overview'):
+                        pending[paper_id] = {
+                            "title": info.get("title", ""),
+                            "reason": "no_credentials" if not has_credentials else "generation_failed",
+                            "date": today,
+                        }
+                        save_db(pending_file, pending)
                 
                 if not overview or not overview.get('overview'):
                     if verbose:
@@ -304,7 +317,7 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
             iteration += 1
     
     save_db(db_file, db)
-    return processed
+    return processed, len(pending)
 
 
 def build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs) -> tuple:
