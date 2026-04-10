@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Overview generation using Playwright automation."""
 
+import logging
 import time
 from pathlib import Path
 from typing import Optional, Tuple
+
+from config import ALPHAXIV_WEB_URL, BROWSER_PROFILE
+
+logger = logging.getLogger(__name__)
 
 try:
     from playwright.sync_api import sync_playwright, Browser, Page
@@ -12,12 +17,10 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 
-BROWSER_PROFILE = Path.home() / ".alphaxiv" / "browser-profile-login"
-
-
 def load_credentials(secret_file: Optional[Path] = None) -> Tuple[Optional[str], Optional[str]]:
     """Load email and password from SECRET.md or environment."""
     import os
+    import stat
     
     # Try environment variables first
     email = os.getenv("ALPHAXIV_EMAIL")
@@ -33,6 +36,20 @@ def load_credentials(secret_file: Optional[Path] = None) -> Tuple[Optional[str],
     if not secret_file.exists():
         return None, None
     
+    # Security: Validate file permissions
+    try:
+        file_stat = os.stat(secret_file)
+        # Check if file is readable by group or others (world)
+        if file_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            print(f"⚠ WARNING: {secret_file} has insecure permissions!")
+            print(f"   Credentials file should be readable only by owner.")
+            print(f"   Fix with: chmod 600 {secret_file}")
+            print(f"   Refusing to load credentials from world/group-readable file.")
+            return None, None
+    except OSError as e:
+        print(f"⚠ WARNING: Could not check permissions for {secret_file}: {e}")
+        return None, None
+    
     content = secret_file.read_text()
     for line in content.split('\n'):
         if line.startswith('email:'):
@@ -46,11 +63,12 @@ def load_credentials(secret_file: Optional[Path] = None) -> Tuple[Optional[str],
 def check_login(page: 'Page') -> bool:
     """Check if user is logged in to alphaXiv."""
     try:
-        page.goto("https://www.alphaxiv.org/", wait_until="load", timeout=15000)
+        page.goto(f"{ALPHAXIV_WEB_URL}/", wait_until="load", timeout=15000)
         page.wait_for_timeout(2000)
         signin_link = page.locator("a[href='/signin']").first
         return not signin_link.is_visible()
-    except:
+    except Exception as e:
+        logger.warning(f"Login check failed: {e}")
         return False
 
 
@@ -58,7 +76,7 @@ def login_to_alphaxiv(page: 'Page', email: str, password: str) -> bool:
     """Login to alphaXiv using Google OAuth."""
     try:
         print("    Logging in to alphaXiv...")
-        page.goto("https://www.alphaxiv.org/signin", wait_until="load", timeout=30000)
+        page.goto(f"{ALPHAXIV_WEB_URL}/signin", wait_until="load", timeout=30000)
         page.wait_for_timeout(3000)
         
         # Click Google login
@@ -88,14 +106,14 @@ def login_to_alphaxiv(page: 'Page', email: str, password: str) -> bool:
             if confirm_btn.is_visible(timeout=3000):
                 print("    Clicking confirm...")
                 confirm_btn.click()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"No confirm button (expected): {e}")
         
         # Wait for redirect to alphaXiv
         print("    Waiting for redirect...")
         for i in range(30):
             time.sleep(1)
-            if "alphaxiv.org" in page.url and "signin" not in page.url:
+            if "alphaxiv.org" in page.url and "/signin" not in page.url:
                 print("    ✓ Login successful!")
                 return True
         
@@ -130,8 +148,8 @@ def ensure_overview_generated(paper_id: str, version_id: str, client, secret_fil
         overview = client.get_overview(version_id)
         if overview and overview.get('overview'):
             return True
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Could not fetch overview for {version_id}, will attempt generation: {e}")
     
     # Need to generate - load credentials
     email, password = load_credentials(secret_file)
@@ -144,9 +162,22 @@ def ensure_overview_generated(paper_id: str, version_id: str, client, secret_fil
     
     print(f"    🤖 Generating overview for {paper_id}...")
     
+    context = None
     try:
         with sync_playwright() as playwright:
-            # Launch persistent context to save login state
+            import os
+            import stat
+            
+            BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+            
+            try:
+                profile_stat = os.stat(BROWSER_PROFILE)
+                if profile_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                    print(f"    ⚠ WARNING: Browser profile {BROWSER_PROFILE} has insecure permissions!")
+                    print(f"    Fix with: chmod 700 {BROWSER_PROFILE}")
+            except OSError:
+                pass
+            
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(BROWSER_PROFILE),
                 headless=headless,
@@ -156,17 +187,13 @@ def ensure_overview_generated(paper_id: str, version_id: str, client, secret_fil
             
             page = context.new_page()
             
-            # Check if logged in
             if not check_login(page):
                 if not login_to_alphaxiv(page, email, password):
-                    context.close()
                     return False
             
-            # Navigate to paper overview page
-            page.goto(f"https://www.alphaxiv.org/overview/{paper_id}", wait_until="load")
+            page.goto(f"{ALPHAXIV_WEB_URL}/overview/{paper_id}", wait_until="load")
             time.sleep(5)
             
-            # Try to find and click generate button
             for pattern in ["Generate", "generate", "Create", "Request"]:
                 try:
                     btn = page.locator(f'button:has-text("{pattern}")').first
@@ -175,31 +202,31 @@ def ensure_overview_generated(paper_id: str, version_id: str, client, secret_fil
                         btn.click()
                         time.sleep(2)
                         break
-                except:
+                except Exception as e:
+                    logger.debug(f"Button '{pattern}' not found: {e}")
                     continue
             
-            # Wait for overview generation (up to 90 seconds)
             print("    ⏳ Waiting for overview generation (up to 90s)...")
             for i in range(90):
                 time.sleep(1)
                 
-                # Check if overview is ready
                 try:
                     overview = client.get_overview(version_id)
                     if overview and overview.get('overview'):
                         print("    ✓ Overview generated successfully!")
-                        context.close()
                         return True
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Polling overview for {version_id}: {e}")
             
             print("    ⚠ Overview generation timeout. It may still be processing.")
-            context.close()
             return False
             
     except Exception as e:
         print(f"    ✗ Overview generation failed: {e}")
         return False
+    finally:
+        if context:
+            context.close()
 
 
 def is_playwright_available() -> bool:
