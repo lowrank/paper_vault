@@ -337,7 +337,7 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                     cited_id = c.get("arxivId") or c.get("arxiv_id") or c.get("paper_id")
                     if cited_id:
                         add_citation_triple(paper_id, cited_id, KG_PATH)
-                for topic in extract_keywords(overview, info)[:5]:
+                for topic in categories[:5]:
                     add_topic_triple(paper_id, topic, KG_PATH)
                 
                 if processed % 10 == 0:
@@ -377,7 +377,7 @@ def build_note(paper_id, info, overview, similar, today, db, images_dir, downloa
     citations = overview.get('citations', [])
     keywords = extract_keywords(overview, info)
     
-    all_tags = list(dict.fromkeys((categories or []) + keywords))
+    all_tags = list(dict.fromkeys(categories or []))
     
     report_link = f"> [!tip] See Also\n> [[./reports/{paper_id}_report.md|Intermediate Report]]" if has_report else ""
     
