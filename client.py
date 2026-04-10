@@ -9,11 +9,8 @@ from typing import Optional, Dict, List, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from alphaxiv_cli.storage.cache import Cache
-
-
-BASE_API_URL = "https://api.alphaxiv.org"
-USER_AGENT = "alphaxiv-cli/1.0"
+from storage.cache import Cache
+from config import BASE_API_URL, USER_AGENT, DEFAULT_CACHE_DIR, DEFAULT_CACHE_TTL_HOURS, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES
 
 
 class AlphaXivError(Exception):
@@ -24,13 +21,14 @@ class AlphaXivError(Exception):
 class AlphaXivClient:
     """Client for interacting with alphaXiv API."""
     
-    def __init__(self, timeout: float = 30.0, max_retries: int = 3, cache_dir: Optional[str] = None, cache_ttl: int = 24, api_key: Optional[str] = None):
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT, max_retries: int = DEFAULT_MAX_RETRIES, cache_dir: Optional[str] = None, cache_ttl: int = DEFAULT_CACHE_TTL_HOURS, api_key: Optional[str] = None):
         self.timeout = timeout
         self.max_retries = max_retries
         self._headers = {"User-Agent": USER_AGENT}
         if api_key:
             self._headers["Authorization"] = f"Bearer {api_key}"
-        self._cache = Cache(cache_dir=cache_dir or ".cache/alphaxiv", ttl_hours=cache_ttl)
+        self._cache = Cache(cache_dir=cache_dir or DEFAULT_CACHE_DIR, ttl_hours=cache_ttl)
+        self._http_client = httpx.Client(timeout=self.timeout, headers=self._headers)
     
     def _cache_key(self, url: str, params: Optional[Dict] = None) -> str:
         """Generate cache key from URL and params."""
@@ -41,13 +39,11 @@ class AlphaXivClient:
     
     def _request(self, method: str, url: str, use_cache: bool = True, **kwargs) -> httpx.Response:
         """Make HTTP request with retry logic and caching."""
-        # Check cache for GET requests
         cache_key = None
         if use_cache and method.upper() == "GET":
             cache_key = self._cache_key(url, kwargs.get("params"))
             cached = self._cache.get(cache_key)
             if cached is not None:
-                # Create mock response from cache
                 class CachedResponse:
                     def __init__(self, data):
                         self.status_code = 200
@@ -56,31 +52,25 @@ class AlphaXivClient:
                         return self._data
                 return CachedResponse(cached)
         
-        kwargs.setdefault("headers", self._headers)
-        kwargs.setdefault("timeout", self.timeout)
-        
         for attempt in range(self.max_retries):
             try:
-                with httpx.Client() as client:
-                    response = client.request(method, url, **kwargs)
-                    
-                    if response.status_code >= 400:
-                        if response.status_code == 429 and attempt < self.max_retries - 1:
-                            # Rate limited, wait and retry
-                            wait_time = 2 ** attempt
-                            time.sleep(wait_time)
-                            continue
-                        raise AlphaXivError(f"API error: {response.status_code} - {response.text[:200]}")
-                    
-                    # Cache successful GET responses
-                    if use_cache and method.upper() == "GET" and cache_key:
-                        try:
-                            self._cache.set(cache_key, response.json())
-                        except Exception:
-                            pass  # Don't fail request if caching fails
-                    
-                    return response
-                    
+                response = self._http_client.request(method, url, **kwargs)
+                
+                if response.status_code >= 400:
+                    if response.status_code == 429 and attempt < self.max_retries - 1:
+                        wait_time = 2 ** attempt
+                        time.sleep(wait_time)
+                        continue
+                    raise AlphaXivError(f"API error: HTTP {response.status_code} for {method} {url[:100]}")
+                
+                if use_cache and method.upper() == "GET" and cache_key:
+                    try:
+                        self._cache.set(cache_key, response.json())
+                    except Exception:
+                        pass
+                
+                return response
+                
             except httpx.TimeoutException:
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
@@ -252,8 +242,14 @@ class AlphaXivClient:
         return response.json()
     
     def close(self):
-        """Close client (no-op for httpx)."""
-        pass
+        """Close HTTP client and release connections."""
+        self._http_client.close()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        self.close()
 
 
 def get_client() -> AlphaXivClient:
