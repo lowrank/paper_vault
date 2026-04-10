@@ -5,6 +5,7 @@ import typer
 import json
 import sys
 import re
+import httpx
 from typing import Optional
 from collections import deque
 from datetime import datetime
@@ -16,8 +17,11 @@ logger = logging.getLogger(__name__)
 from client import AlphaXivClient, AlphaXivError
 from overview_generator import ensure_overview_generated, load_credentials
 from utils.helpers import extract_version_id
-from config import PALACE_PATH, KG_PATH
+from config import PALACE_PATH, KG_PATH, DEFAULT_CACHE_DIR
 from storage.memory import upsert_paper, add_citation_triple, add_topic_triple
+from storage.cache import Cache
+
+_cat_cache = Cache(cache_dir=DEFAULT_CACHE_DIR, ttl_hours=24 * 30)
 
 app = typer.Typer(name="graph", help="Build Obsidian knowledge graph")
 
@@ -195,6 +199,29 @@ def sanitize_paper_id(paper_id: str) -> str:
     return safe_id[:255]
 
 
+def get_arxiv_categories(paper_id: str) -> list:
+    cache_key = f"arxiv_cats:{paper_id}"
+    cached = _cat_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        r = httpx.get(f"https://arxiv.org/abs/{paper_id}", timeout=10)
+        labels = re.findall(r'<span class="primary-subject">([^<]+)</span>', r.text)
+        labels += re.findall(r'<span class="secondary-subject">([^<]+)</span>', r.text)
+        codes = re.findall(r'context=([a-z]+\.[A-Z]+)', r.text)
+        # also extract short codes embedded in labels like "Analysis of PDEs (math.AP)"
+        for label in labels:
+            m = re.search(r'\(([a-z]+\.[A-Z]+)\)', label)
+            if m:
+                codes.append(m.group(1))
+        result = list(dict.fromkeys(codes))
+        _cat_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        logger.debug(f"Failed to fetch arxiv categories for {paper_id}: {e}")
+        return []
+
+
 def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_file, iterations, limit, verbose, download_imgs, secret_path=None, headless=True):
     """Build knowledge graph with BFS traversal."""
     queue = deque([(start_id, 0, None)])
@@ -280,7 +307,8 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
                 
                 similar = client.get_similar_papers(paper_id, limit)
                 
-                note, report = build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs)
+                categories = get_arxiv_categories(paper_id)
+                note, report = build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs, categories)
                 
                 safe_id = sanitize_paper_id(paper_id)
                 note_path = output_dir / f"{safe_id}.md"
@@ -332,7 +360,7 @@ def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_fi
     return processed, len(pending)
 
 
-def build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs) -> tuple:
+def build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs, categories=None) -> tuple:
     """Build Obsidian note with full formatting. Returns (note_content, report_content)."""
     title = info.get("title", "Unknown")
     abstract = info.get("abstract", "N/A")
@@ -349,7 +377,7 @@ def build_note(paper_id, info, overview, similar, today, db, images_dir, downloa
     citations = overview.get('citations', [])
     keywords = extract_keywords(overview, info)
     
-    all_tags = keywords
+    all_tags = list(dict.fromkeys((categories or []) + keywords))
     
     report_link = f"> [!tip] See Also\n> [[./reports/{paper_id}_report.md|Intermediate Report]]" if has_report else ""
     
