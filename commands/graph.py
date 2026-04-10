@@ -80,25 +80,6 @@ def save_db(db_file: Path, db: dict):
     db_file.write_text(json.dumps(db, indent=2))
 
 
-def get_arxiv_categories(paper_id: str) -> list:
-    """Get arXiv subject classifications."""
-    import httpx
-    try:
-        resp = httpx.get(f'https://export.arxiv.org/api/query?id_list={paper_id}', timeout=10)
-        if resp.status_code == 200:
-            cats = re.findall(r'<category term="([^"]+)"', resp.text)
-            filtered = []
-            for c in cats:
-                if c.startswith(('math.', 'physics.', 'cs.', 'stat.', 'q-bio.', 'q-fin.', 'econ.')):
-                    filtered.append(c.replace('.', '-'))
-            return filtered
-    except httpx.RequestError as e:
-        logger.warning(f"Failed to fetch arXiv categories for {paper_id}: {e}")
-    except Exception as e:
-        logger.warning(f"Unexpected error fetching arXiv categories for {paper_id}: {e}")
-    return []
-
-
 def extract_keywords(overview: Optional[dict], paper_info: Optional[dict] = None) -> list:
     """Extract keywords from overview and paper info."""
     topics = []
@@ -336,9 +317,8 @@ def build_note(paper_id, info, overview, similar, today, db, images_dir, downloa
     
     citations = overview.get('citations', [])
     keywords = extract_keywords(overview, info)
-    arxiv_cats = get_arxiv_categories(paper_id)
     
-    all_tags = list(set(keywords + arxiv_cats))
+    all_tags = keywords
     
     report_link = f"> [!tip] See Also\n> [[./reports/{paper_id}_report.md|Intermediate Report]]" if has_report else ""
     
