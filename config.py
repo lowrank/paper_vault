@@ -19,5 +19,5 @@ KG_PATH = Path.home() / ".alphaxiv" / "knowledge_graph.sqlite3"
 
 # HTTP
 DEFAULT_TIMEOUT = 30.0
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 IMAGE_MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """AlphaXiv API Client."""
 
-import httpx
-import time
 import hashlib
+import httpx
+import logging
+import time
 from typing import Optional, Dict, List, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote as _urlquote
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_id(paper_id: str) -> str:
@@ -134,13 +137,19 @@ class AlphaXivClient:
                         return self._data
                 return CachedResponse(cached)
         
+        _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
         for attempt in range(self.max_retries):
             try:
                 response = self._http_client.request(method, url, **kwargs)
                 
                 if response.status_code >= 400:
-                    if response.status_code == 429 and attempt < self.max_retries - 1:
-                        wait_time = 2 ** attempt
+                    if response.status_code in _RETRYABLE_STATUS and attempt < self.max_retries - 1:
+                        wait_time = 2 ** (attempt + 1)  # 2, 4, 8, ...
+                        logger.debug(
+                            f"HTTP {response.status_code} for {url[:80]} "
+                            f"-- retrying in {wait_time}s (attempt {attempt + 1}/{self.max_retries})"
+                        )
                         time.sleep(wait_time)
                         continue
                     raise AlphaXivError(f"API error: HTTP {response.status_code} for {method} {url[:100]}")
@@ -155,10 +164,13 @@ class AlphaXivClient:
                 
             except httpx.TimeoutException:
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(2 ** (attempt + 1))
                     continue
                 raise AlphaXivError(f"Request timeout after {self.max_retries} attempts")
             except httpx.RequestError as e:
+                if attempt < self.max_retries - 1:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
                 raise AlphaXivError(f"Request failed: {e}")
         
         raise AlphaXivError("Max retries exceeded")
