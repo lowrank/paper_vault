@@ -38,6 +38,7 @@ from typing import Optional, List
 import typer
 from rich import print as rprint
 from rich.console import Console
+from rich.markup import escape as markup_escape
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
@@ -407,7 +408,7 @@ def query(
 
         body = doc[:400] + "…" if len(doc) > 400 else doc
         console.print(Panel(
-            f"[bold]{title or paper_id}[/bold] [dim][{paper_id}][/dim]{hall_str}{dist_str}\n\n{body}",
+            f"[bold]{markup_escape(title or paper_id)}[/bold] [dim][{paper_id}][/dim]{hall_str}{dist_str}\n\n{markup_escape(body)}",
             title=f"#{i}",
             border_style="dim",
         ))
@@ -462,7 +463,7 @@ def walk(
         if d["paper_id"] != current_paper:
             current_paper = d["paper_id"]
             console.print(f"\n[bold magenta]Room: {current_paper}[/bold magenta]")
-        console.print(f"  [dim][{d['label']}][/dim]  {d['content'][:300]}")
+        console.print(f"  [dim][{d['label']}][/dim]  {markup_escape(d['content'][:300])}")
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +620,7 @@ def synthesize(
         out_path.write_text(md)
         console.print(f"\n[bold green]✓ Synthesis saved to {output}[/bold green]")
     else:
-        console.print(md)
+        console.print(markup_escape(md))
 
     prev = get_syntheses(wing, _palace_db())
     console.print(f"\n[dim]{len(prev)} synthesis version(s) stored in palace.[/dim]\n")
@@ -710,7 +711,7 @@ def _print_wing_status(wing: str, data: dict):
         console.print("[bold]Closet index:[/bold]")
         for cl in closets:
             kw = ", ".join(cl["keywords"][:4]) if cl["keywords"] else "—"
-            console.print(f"  [dim]{cl['paper_id']}[/dim]  [{kw}]  {cl['summary'][:100]}")
+            console.print(f"  [dim]{cl['paper_id']}[/dim]  [{kw}]  {markup_escape(cl['summary'][:100])}")
         console.print()
 
 
@@ -1033,7 +1034,7 @@ def _enter_room(wing: str, paper_id: str, hall: Optional[str], full: bool) -> No
 
     if data["summary"]:
         console.print(Panel(
-            data["summary"],
+            markup_escape(data["summary"]),
             title="[magenta]Closet (distilled summary)[/magenta]",
             border_style="magenta",
         ))
@@ -1061,10 +1062,10 @@ def _enter_room(wing: str, paper_id: str, hall: Optional[str], full: bool) -> No
             continue
         console.print(f"\n[bold magenta]{_HALL_DISPLAY[h]}[/bold magenta]")
         for d in drawers:
-            body = d["content"] if full else (
+            raw = d["content"] if full else (
                 d["content"][:truncate] + "…" if len(d["content"]) > truncate else d["content"]
             )
-            console.print(Panel(body, title=f"[dim]{d['label']}[/dim]", border_style="dim"))
+            console.print(Panel(markup_escape(raw), title=f"[dim]{markup_escape(d['label'])}[/dim]", border_style="dim"))
 
     if data["tunnels"]:
         console.print(f"\n[bold]Tunnels ({len(data['tunnels'])})[/bold]")
