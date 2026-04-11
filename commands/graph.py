@@ -15,9 +15,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 logger = logging.getLogger(__name__)
 
 from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
-from alphaxiv_cli.overview_generator import ensure_overview_generated, load_credentials
+from alphaxiv_cli.overview_generator import ensure_overview_generated, is_session_valid
 from alphaxiv_cli.utils.helpers import extract_version_id
-from alphaxiv_cli.config import PALACE_PATH, KG_PATH, DEFAULT_CACHE_DIR
+from alphaxiv_cli.config import DEFAULT_CACHE_DIR
+from alphaxiv_cli.context import get_context
 from alphaxiv_cli.storage.memory import upsert_paper, add_citation_triple, add_topic_triple
 from alphaxiv_cli.storage.cache import Cache
 
@@ -34,41 +35,52 @@ def main(
     limit: int = typer.Option(5, "--limit", "-l", help="Similar papers per paper"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     download_images: bool = typer.Option(False, "--images", help="Download images from overview"),
-    secret_file: Optional[str] = typer.Option(None, "--secret", help="Path to SECRET.md with credentials"),
-    headless: bool = typer.Option(False, "--headless/--no-headless", help="Run Playwright in headless mode (default: visible browser)"),
+    headless: bool = typer.Option(True, "--headless/--no-headless", help="Run overview-generation browser in headless mode (default: headless)"),
 ):
-    """Build Obsidian notes with paper connections."""
+    """
+    Build Obsidian notes with BFS paper connections.
+
+    For papers that already have an AI overview on alphaxiv the note is
+    generated immediately.  For papers without one, browser automation
+    triggers generation using the saved login session (run `axiv login`
+    once to save the session).
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     reports_dir = output_path / "reports"
-    images_dir = output_path / "images"
-    db_file = output_path / "papers_db.json"
-    db = load_db(db_file)
-    
+    images_dir  = output_path / "images"
+    db_file     = output_path / "papers_db.json"
+    db          = load_db(db_file)
+
     try:
         with AlphaXivClient() as client:
             info = client.resolve_paper(paper_id)
             if not info:
                 print(f"Error: Paper not found: {paper_id}", file=sys.stderr)
                 raise typer.Exit(1)
-            
+
             title = info.get("title", "Unknown")
-            
+            session_ok = is_session_valid()
+
             print(f"Building knowledge graph: {title}")
             print(f"Output: {output_dir}")
-            print(f"Iterations: {iterations}, Limit: {limit}\n")
-            
+            print(f"Iterations: {iterations}, Limit: {limit}")
+            if not session_ok:
+                print("  Note: no valid alphaxiv session — papers without overviews will be skipped.")
+                print("  Run `axiv login` to save a session and enable overview generation.")
+            print()
+
             count, pending = build_graph(
                 client, paper_id, output_path, reports_dir, images_dir,
                 db, db_file, iterations, limit, verbose, download_images,
-                Path(secret_file) if secret_file else None, headless
+                session_ok, headless,
             )
-            
+
             print(f"\n✓ Generated {count} paper notes")
             if pending:
                 print(f"  {pending} paper(s) skipped — see {output_dir}/pending_generation.json")
-            
+
     except AlphaXivError as e:
         print(f"Error: {e}", file=sys.stderr)
         raise typer.Exit(1)
@@ -228,150 +240,166 @@ def get_arxiv_categories(paper_id: str) -> list:
         return []
 
 
-def build_graph(client, start_id, output_dir, reports_dir, images_dir, db, db_file, iterations, limit, verbose, download_imgs, secret_path=None, headless=True):
-    """Build knowledge graph with BFS traversal."""
-    queue = deque([(start_id, 0, None)])
-    processed = 0
-    iteration = 0
-    today = datetime.now().strftime("%Y-%m-%d")
-    pending_file = output_dir / "pending_generation.json"
-    pending = load_db(pending_file)
+def build_graph(
+    client, start_id, output_dir, reports_dir, images_dir,
+    db, db_file, iterations, limit, verbose, download_imgs,
+    session_ok=False, headless=True,
+):
+    """
+    BFS traversal: generate Obsidian notes for a paper and its neighbours.
 
-    credentials = load_credentials(secret_path)
-    has_credentials = bool(credentials[0] and credentials[1])
-    
+    session_ok  — True if a valid alphaxiv login session exists (from `axiv login`).
+                  When False, papers without existing overviews are skipped.
+    """
+    ctx          = get_context()
+    palace_path  = ctx.palace_dir
+    kg_path      = ctx.kg_db
+
+    queue        = deque([(start_id, 0, None)])
+    processed    = 0
+    iteration    = 0
+    today        = datetime.now().strftime("%Y-%m-%d")
+    pending_file = output_dir / "pending_generation.json"
+    pending      = load_db(pending_file)
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
     ) as progress:
-        
+
         while queue and iteration < iterations:
             current_batch_size = len(queue)
             task = progress.add_task(
-                f"[cyan]Iteration {iteration + 1}/{iterations} - Processing {current_batch_size} papers",
-                total=current_batch_size
+                f"[cyan]Iteration {iteration + 1}/{iterations} — {current_batch_size} papers",
+                total=current_batch_size,
             )
-            
             new_queue = deque()
-            
+
             while queue:
                 paper_id, depth, related_to = queue.popleft()
-                
+
                 if paper_id in db:
                     if verbose:
                         print(f"  [skip] {paper_id} (already processed)")
                     progress.advance(task)
                     continue
-                
+
                 if verbose:
-                    print(f"  [{depth}] Processing: {paper_id} (related_to={related_to})")
-                
+                    print(f"  [{depth}] Processing: {paper_id}")
+
                 info = client.resolve_paper(paper_id)
                 if not info:
-                    if verbose:
-                        print(f"  Failed to resolve: {paper_id}")
                     progress.advance(task)
                     continue
-                
+
                 version_id = extract_version_id(info)
                 if not version_id:
                     progress.advance(task)
                     continue
-                
+
+                # --- fetch overview ---
+                overview = None
                 try:
                     overview = client.get_overview(version_id)
-                except Exception as e:
+                except Exception:
+                    pass
+
+                # --- no overview: try generation if session is valid ---
+                if (not overview or not overview.get("overview")) and session_ok:
+                    progress.stop()
                     if verbose:
-                        print(f"  No overview for {paper_id}: {e}")
-                    overview = None
-                    
-                    if has_credentials:
-                        if verbose:
-                            print(f"  Attempting to generate overview for {paper_id}...")
-                        if ensure_overview_generated(paper_id, version_id, client, secret_path, headless):
-                            import time
-                            for retry in range(5):
-                                try:
-                                    overview = client.get_overview(version_id, use_cache=False)
-                                    if overview and overview.get('overview'):
-                                        break
-                                    time.sleep(2)
-                                except AlphaXivError as e2:
-                                    if '404' not in str(e2) or retry >= 4:
-                                        logger.warning(f"Failed to fetch overview after generation for {paper_id}: {e2}")
-                                        overview = None
-                                        break
-                                    time.sleep(2)
-                    
-                    if not overview or not overview.get('overview'):
-                        pending[paper_id] = {
-                            "title": info.get("title", ""),
-                            "reason": "no_credentials" if not has_credentials else "generation_failed",
-                            "date": today,
-                        }
-                        save_db(pending_file, pending)
-                
-                if not overview or not overview.get('overview'):
+                        print(f"  Requesting overview generation for {paper_id}…")
+                    ok = ensure_overview_generated(
+                        paper_id, version_id, client, headless=headless,
+                    )
+                    progress.start()
+                    if ok:
+                        try:
+                            overview = client.get_overview(version_id)
+                        except Exception:
+                            pass
+
+                if not overview or not overview.get("overview"):
+                    pending[paper_id] = {
+                        "title": info.get("title", ""),
+                        "reason": "no_session" if not session_ok else "generation_failed",
+                        "date": today,
+                    }
+                    save_db(pending_file, pending)
                     if verbose:
-                        print(f"  Skipping {paper_id} - no overview available")
+                        print(f"  Skip {paper_id} — no overview")
                     progress.advance(task)
                     continue
-                
-                similar = client.get_similar_papers(paper_id, limit)
-                
+
+                # --- build note ---
+                similar    = client.get_similar_papers(paper_id, limit)
                 categories = get_arxiv_categories(paper_id)
-                note, report = build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs, categories)
-                
-                safe_id = sanitize_paper_id(paper_id)
+                note, report = build_note(
+                    paper_id, info, overview, similar, today,
+                    db, images_dir, download_imgs, categories,
+                )
+
+                safe_id   = sanitize_paper_id(paper_id)
                 note_path = output_dir / f"{safe_id}.md"
-                
                 if not note_path.resolve().is_relative_to(output_dir.resolve()):
                     raise ValueError(f"Path traversal detected: {paper_id}")
-                
                 note_path.write_text(note)
-                
+
                 if report:
                     reports_dir.mkdir(parents=True, exist_ok=True)
                     report_path = reports_dir / f"{safe_id}_report.md"
-                    
                     if not report_path.resolve().is_relative_to(reports_dir.resolve()):
-                        raise ValueError(f"Path traversal detected in report: {paper_id}")
-                    
+                        raise ValueError(f"Path traversal in report: {paper_id}")
                     report_path.write_text(report)
                     if verbose:
-                        print(f"  Created intermediate report: {paper_id}_report.md")
-                
-                db[paper_id] = {"title": info.get("title", ""), "processed": True, "date": today}
+                        print(f"  Report: {safe_id}_report.md")
+
+                db[paper_id] = {
+                    "title": info.get("title", ""), "processed": True, "date": today,
+                }
                 processed += 1
-                
-                upsert_paper(paper_id, info, overview, PALACE_PATH)
+
+                # --- persist to palace / KG ---
+                upsert_paper(paper_id, info, overview, palace_path)
                 for c in overview.get("citations", []):
-                    cited_id = c.get("arxivId") or c.get("arxiv_id") or c.get("paper_id")
+                    cited_id = (
+                        c.get("arxivId") or c.get("arxiv_id") or c.get("paper_id")
+                        or _arxiv_id_from_link(c.get("alphaxivLink", ""))
+                    )
                     if cited_id:
-                        add_citation_triple(paper_id, cited_id, KG_PATH)
+                        add_citation_triple(paper_id, cited_id, kg_path)
                 for topic in extract_keywords(overview, info)[:5]:
-                    add_topic_triple(paper_id, topic, KG_PATH)
-                
+                    add_topic_triple(paper_id, topic, kg_path)
+
                 if processed % 10 == 0:
                     save_db(db_file, db)
-                
+
+                # --- enqueue neighbours ---
                 if depth < iterations - 1:
                     for sp in similar[:limit]:
                         spid = sp.get("universal_paper_id") or sp.get("paper_id")
                         if spid and spid not in db:
                             new_queue.append((spid, depth + 1, paper_id))
-                
-                title = info.get('title', '')[:40]
-                progress.update(task, description=f"[green]✓ {paper_id}: {title}...")
+
+                progress.update(
+                    task,
+                    description=f"[green]✓ {paper_id}: {info.get('title','')[:40]}",
+                )
                 progress.advance(task)
-            
-            queue = new_queue
+
+            queue     = new_queue
             iteration += 1
-    
+
     save_db(db_file, db)
     return processed, len(pending)
+
+
+def _arxiv_id_from_link(link: str) -> Optional[str]:
+    """Extract arXiv ID from an alphaxiv URL like https://alphaxiv.org/abs/1503.03585."""
+    m = re.search(r"/abs/([0-9]{4}\.[0-9]+)", link)
+    return m.group(1) if m else None
 
 
 def build_note(paper_id, info, overview, similar, today, db, images_dir, download_imgs, categories=None) -> tuple:

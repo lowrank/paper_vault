@@ -327,9 +327,22 @@ axiv graph main <paper_id> \
   --images \
   --verbose \
   --generate \
-  --secret SECRET.md \
   -o output/
 ```
+
+`axiv graph` vs `axiv research expand` + `axiv research link`:
+
+| | `axiv graph main` | `research expand` + `research link` |
+|---|---|---|
+| Output | `.md` notes written immediately | Palace DB first, notes written separately |
+| Traversal | BFS by similar-papers | BFS by similar-papers |
+| Depth control | `--iterations` | `--hops` |
+| Overview missing | triggers generation, skips if fails | triggers generation, skips if fails |
+| Dedup | `papers_db.json` | wing rooms table |
+| Queryable / synthesizable | no | yes (`query`, `synthesize`, `visualize`) |
+| Best for | quick one-shot note generation | persistent research that grows over time |
+
+Both require `axiv login` first for papers that don't yet have an AI overview.
 
 Output structure:
 
