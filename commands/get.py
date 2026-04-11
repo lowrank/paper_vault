@@ -5,8 +5,8 @@ import json
 import sys
 from typing import Optional
 
-from client import AlphaXivClient, AlphaXivError
-from utils.helpers import extract_version_id
+from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
+from alphaxiv_cli.utils.helpers import extract_version_id
 
 app = typer.Typer(name="get", help="Fetch paper data from alphaXiv")
 

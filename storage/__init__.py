@@ -1,4 +1,4 @@
 """Storage utilities."""
-from storage.cache import Cache, PaperDatabase
+from alphaxiv_cli.storage.cache import Cache, PaperDatabase
 
 __all__ = ["Cache", "PaperDatabase"]

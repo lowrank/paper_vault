@@ -8,7 +8,7 @@ from typing import Optional
 from collections import deque
 from datetime import datetime
 
-from client import AlphaXivClient, AlphaXivError
+from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
 
 app = typer.Typer(name="explore", help="Explore paper connections deeply")
 

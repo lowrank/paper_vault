@@ -14,12 +14,12 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 logger = logging.getLogger(__name__)
 
-from client import AlphaXivClient, AlphaXivError
-from overview_generator import ensure_overview_generated, load_credentials
-from utils.helpers import extract_version_id
-from config import PALACE_PATH, KG_PATH, DEFAULT_CACHE_DIR
-from storage.memory import upsert_paper, add_citation_triple, add_topic_triple
-from storage.cache import Cache
+from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
+from alphaxiv_cli.overview_generator import ensure_overview_generated, load_credentials
+from alphaxiv_cli.utils.helpers import extract_version_id
+from alphaxiv_cli.config import PALACE_PATH, KG_PATH, DEFAULT_CACHE_DIR
+from alphaxiv_cli.storage.memory import upsert_paper, add_citation_triple, add_topic_triple
+from alphaxiv_cli.storage.cache import Cache
 
 _cat_cache = Cache(cache_dir=DEFAULT_CACHE_DIR, ttl_hours=24 * 30)
 

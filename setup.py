@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from setuptools import setup, find_packages
+import os
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -7,6 +8,10 @@ with open("README.md", "r", encoding="utf-8") as fh:
 with open("requirements.txt", "r", encoding="utf-8") as fh:
     requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
 
+# The project uses a flat layout: all source files sit directly in the repo
+# root alongside setup.py.  We map the logical package name "alphaxiv_cli"
+# to "." so that `import alphaxiv_cli` resolves to the repo root, and
+# sub-packages (commands/, storage/, utils/) are discovered automatically.
 setup(
     name="alphaxiv-cli",
     version="0.1.0",
@@ -15,7 +20,12 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/lowrank/paper_vault",
-    packages=find_packages(),
+    package_dir={"alphaxiv_cli": "."},
+    packages=["alphaxiv_cli"] + [
+        "alphaxiv_cli." + p
+        for p in find_packages(exclude=["tests*"])
+        if p not in ("alphaxiv_cli",)
+    ],
     classifiers=[
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",

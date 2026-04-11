@@ -8,14 +8,52 @@ import asyncio
 from typing import Optional, Dict, List, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote as _urlquote
 
-from storage.cache import Cache
-from config import BASE_API_URL, USER_AGENT, DEFAULT_CACHE_DIR, DEFAULT_CACHE_TTL_HOURS, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES
+
+def _encode_id(paper_id: str) -> str:
+    """
+    URL-encode an arXiv paper or version ID for use as a URL path segment.
+
+    Old-style IDs (pre-2007) contain a literal slash, e.g. 'math/0504536' or
+    'hep-th/0305001'.  Interpolating them directly into an f-string URL turns
+    that slash into a path separator, producing a 404.  Encoding it as %2F
+    makes the whole ID a single path segment as intended.
+    """
+    return _urlquote(paper_id, safe="")
+
+from alphaxiv_cli.storage.cache import Cache
+from alphaxiv_cli.config import BASE_API_URL, USER_AGENT, DEFAULT_CACHE_DIR, DEFAULT_CACHE_TTL_HOURS, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES
 
 
 class AlphaXivError(Exception):
     """AlphaXiv API error."""
     pass
+
+
+def _arxiv_result_to_dict(r) -> Dict[str, Any]:
+    """Convert an arxiv.Result object to a plain dict matching our schema."""
+    import re as _re
+    # get_short_id() returns e.g. "2206.02262v4" — strip version suffix
+    short_id = r.get_short_id()
+    arxiv_id = _re.sub(r"v\d+$", "", short_id)
+    return {
+        "universal_paper_id": arxiv_id,
+        "paper_id":           arxiv_id,
+        "title":              r.title.strip().replace("\n", " "),
+        "abstract":           r.summary.strip().replace("\n", " "),
+        "authors":            [a.name for a in r.authors],
+        "categories":         r.categories,
+        "primary_category":   r.primary_category,
+        "updated":            r.updated.strftime("%Y-%m-%d") if r.updated else "",
+        "published":          r.published.strftime("%Y-%m-%d") if r.published else "",
+        "comment":            (r.comment or "").strip(),
+        "journal_ref":        (r.journal_ref or "").strip(),
+        "doi":                (r.doi or "").strip(),
+        "pdf_url":            r.pdf_url or "",
+        "arxiv_url":          f"https://arxiv.org/abs/{arxiv_id}",
+        "alphaxiv_url":       f"https://alphaxiv.org/abs/{arxiv_id}",
+    }
 
 
 class AlphaXivClient:
@@ -83,7 +121,7 @@ class AlphaXivClient:
     
     def resolve_paper(self, paper_id: str) -> Optional[Dict[str, Any]]:
         """Resolve arXiv ID to paper info."""
-        url = f"{BASE_API_URL}/papers/v3/{paper_id}"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -93,7 +131,7 @@ class AlphaXivClient:
     
     def get_overview(self, version_id: str, language: str = "en", use_cache: bool = True) -> Optional[Dict[str, Any]]:
         """Fetch paper overview (AI-generated summary)."""
-        url = f"{BASE_API_URL}/papers/v3/{version_id}/overview/{language}"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/overview/{language}"
         response = self._request("GET", url, use_cache=use_cache)
         
         if response.status_code == 404:
@@ -103,7 +141,7 @@ class AlphaXivClient:
     
     def get_metrics(self, version_id: str) -> Optional[Dict[str, Any]]:
         """Fetch paper metrics."""
-        url = f"{BASE_API_URL}/papers/v3/{version_id}/metrics"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/metrics"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -113,7 +151,7 @@ class AlphaXivClient:
     
     def get_full_text(self, version_id: str) -> Optional[str]:
         """Fetch paper full text."""
-        url = f"{BASE_API_URL}/papers/v3/{version_id}/full-text"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/full-text"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -129,7 +167,7 @@ class AlphaXivClient:
     
     def get_similar_papers(self, paper_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Fetch similar papers."""
-        url = f"{BASE_API_URL}/papers/v3/{paper_id}/similar-papers"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/similar-papers"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -140,7 +178,7 @@ class AlphaXivClient:
     
     def get_citations(self, paper_id: str) -> List[Dict[str, Any]]:
         """Fetch paper citations."""
-        url = f"{BASE_API_URL}/papers/v3/{paper_id}/citations"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/citations"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -150,7 +188,7 @@ class AlphaXivClient:
     
     def get_references(self, paper_id: str) -> List[Dict[str, Any]]:
         """Fetch paper references."""
-        url = f"{BASE_API_URL}/papers/v3/{paper_id}/references"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/references"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -158,16 +196,55 @@ class AlphaXivClient:
         
         return response.json()
     
-    def search(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Search papers by keyword."""
-        url = f"{BASE_API_URL}/papers/v3/search"
-        params = {"q": query, "limit": limit}
-        response = self._request("GET", url, params=params)
-        
-        if response.status_code == 404:
-            return []
-        
-        return response.json()
+    def search(self, query: str, limit: int = 20, sort_by: str = "relevance") -> List[Dict[str, Any]]:
+        """
+        Search arXiv papers via the arxiv.py library (lukasschwab/arxiv.py).
+
+        The alphaxiv search endpoint (/papers/v3/search) returns 404 for all
+        queries; this implementation uses the official arXiv API wrapper instead.
+
+        query syntax:
+          plain text        — title + abstract full-text search
+          ti:word           — title only
+          au:name           — author name
+          cat:cs.LG         — category filter
+          ti:X AND cat:cs.LG — boolean combination
+
+        sort_by: "relevance" | "lastUpdatedDate" | "submittedDate"
+        """
+        import arxiv
+
+        _SORT_MAP = {
+            "relevance":       arxiv.SortCriterion.Relevance,
+            "lastupdateddate": arxiv.SortCriterion.LastUpdatedDate,
+            "submitteddate":   arxiv.SortCriterion.SubmittedDate,
+        }
+        sort_criterion = _SORT_MAP.get(sort_by.lower(), arxiv.SortCriterion.Relevance)
+
+        cache_key = self._cache_key(f"arxiv:search:{sort_by}", {"q": query, "n": limit})
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            search = arxiv.Search(
+                query=query,
+                max_results=limit,
+                sort_by=sort_criterion,
+                sort_order=arxiv.SortOrder.Descending,
+            )
+            client = arxiv.Client(
+                page_size=min(limit, 100),
+                delay_seconds=1.0,
+                num_retries=self.max_retries,
+            )
+            raw_results = list(client.results(search))
+        except Exception as e:
+            raise AlphaXivError(f"arXiv search failed: {e}")
+
+        results = [_arxiv_result_to_dict(r) for r in raw_results]
+        self._cache.set(cache_key, results)
+        return results
     
     def get_similar_papers_batch(self, paper_ids: List[str], limit: int = 10, max_workers: int = 5) -> Dict[str, List[Dict[str, Any]]]:
         """Fetch similar papers for multiple papers in parallel."""
@@ -209,7 +286,7 @@ class AlphaXivClient:
     
     def get_overview_status(self, version_id: str) -> Optional[Dict[str, Any]]:
         """Check overview generation status without fetching the full overview."""
-        url = f"{BASE_API_URL}/papers/v3/{version_id}/overview/status"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/overview/status"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -219,7 +296,7 @@ class AlphaXivClient:
     
     def get_resources(self, version_id: str) -> Optional[Dict[str, Any]]:
         """Fetch paper resources (implementations, datasets, etc.)."""
-        url = f"{BASE_API_URL}/papers/v3/{version_id}/resources"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/resources"
         response = self._request("GET", url)
         
         if response.status_code == 404:
@@ -229,7 +306,7 @@ class AlphaXivClient:
     
     def request_ai_overview(self, paper_id: str, version_order: int = 1, language: str = "en") -> Optional[Dict[str, Any]]:
         """Request AI overview generation for a paper."""
-        url = f"{BASE_API_URL}/papers/v3/{paper_id}/overview/request"
+        url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/overview/request"
         data = {
             "versionOrder": version_order,
             "language": language
