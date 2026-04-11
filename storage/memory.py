@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from alphaxiv_cli.client import extract_overview_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,7 +19,8 @@ def _primary_category(info: dict) -> str:
 def upsert_paper(paper_id: str, info: dict, overview: dict, palace_path: Path) -> None:
     try:
         from mempalace.palace import get_collection
-        text = overview.get("overview") or info.get("abstract", "")
+        overview_text = extract_overview_text(overview)
+        text = overview_text or info.get("abstract", "")
         if not text:
             return
         room = _primary_category(info)

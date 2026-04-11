@@ -38,7 +38,7 @@ def test_sanitize_paper_id_truncates_long_names():
 
 def test_sanitize_paper_id_empty_string():
     result = sanitize_paper_id("")
-    assert result == ""
+    assert result == "unknown"
 
 
 def test_sanitize_paper_id_all_invalid_chars():

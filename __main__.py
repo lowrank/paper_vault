@@ -249,7 +249,13 @@ def _interactive_start(results: list) -> None:
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
     # ── 1. Checkbox selection ──────────────────────────────────────────────
+    SELECT_ALL_SENTINEL = "__SELECT_ALL__"
     choices = [
+        questionary.Choice(
+            title=">> Select all papers <<",
+            value=SELECT_ALL_SENTINEL,
+        ),
+    ] + [
         questionary.Choice(
             title=f"[{p['paper_id']}]  {p['title'][:70]}",
             value=p,
@@ -258,11 +264,21 @@ def _interactive_start(results: list) -> None:
     ]
 
     _console.print()
-    selected = questionary.checkbox(
+    raw_selected = questionary.checkbox(
         "Select papers to add to a research wing:",
         choices=choices,
-        instruction="(Space=toggle  ↑↓=navigate  Enter=confirm  Ctrl-C=cancel)",
+        instruction="(Space=toggle  a=select-all  Enter=confirm  Ctrl-C=cancel)",
     ).ask()
+
+    if not raw_selected:
+        _console.print("[dim]No papers selected.[/dim]\n")
+        return
+
+    # If "Select all" was toggled, replace with every paper
+    if SELECT_ALL_SENTINEL in raw_selected:
+        selected = list(results)
+    else:
+        selected = [p for p in raw_selected if p != SELECT_ALL_SENTINEL]
 
     if not selected:
         _console.print("[dim]No papers selected.[/dim]\n")
@@ -402,7 +418,7 @@ def login():
 @app.command()
 def version():
     """Show version."""
-    from __init__ import __version__
+    from alphaxiv_cli import __version__
     print(f"alphaxiv-cli {__version__}")
 
 

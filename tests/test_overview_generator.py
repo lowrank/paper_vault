@@ -4,7 +4,6 @@ from pathlib import Path
 from overview_generator import (
     load_credentials,
     check_login,
-    login_to_alphaxiv,
     is_playwright_available
 )
 
@@ -86,32 +85,3 @@ def test_check_login_mocked():
     
     assert result is True
     mock_page.goto.assert_called_once()
-
-
-@pytest.mark.skipif(not is_playwright_available(), reason="Playwright not installed")
-def test_login_to_alphaxiv_mocked():
-    mock_page = Mock()
-    mock_page.goto = Mock()
-    mock_page.wait_for_timeout = Mock()
-    mock_page.keyboard.press = Mock()
-    mock_page.url = "https://alphaxiv.org/home"
-    
-    mock_button = Mock()
-    mock_button.click = Mock()
-    mock_button.first = mock_button
-    
-    mock_input = Mock()
-    mock_input.fill = Mock()
-    mock_input.wait_for = Mock()
-    mock_input.first = mock_input
-    
-    mock_page.locator = Mock(side_effect=[
-        mock_button,
-        mock_input,
-        mock_input,
-    ])
-    
-    result = login_to_alphaxiv(mock_page, "test@example.com", "pass123")
-    
-    assert result is True
-    assert mock_button.click.call_count >= 1

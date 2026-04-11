@@ -30,6 +30,8 @@ with richer wing/hall metadata so searches are much more precise.
 import json
 import logging
 import sys
+import threading
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +46,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from rich.table import Table
 from rich.tree import Tree
 
-from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
+from alphaxiv_cli.client import AlphaXivClient, AlphaXivError, has_overview_content
 from alphaxiv_cli.context import get_context
 from alphaxiv_cli.storage.memory import add_citation_triple, add_topic_triple
 from alphaxiv_cli.storage.palace import (
@@ -61,6 +63,8 @@ from alphaxiv_cli.storage.palace import (
     get_wing,
     list_rooms,
     list_wings,
+    remove_paper_from_chroma,
+    remove_paper_from_wing,
     save_synthesis,
     search_palace,
     set_note_link,
@@ -216,6 +220,18 @@ def start(
     wing: str = typer.Argument(..., help="Wing name (research topic slug, e.g. 'score-matching')", autocompletion=_complete_wing),
     paper_ids: List[str] = typer.Argument(..., help="One or more arXiv IDs to seed the wing"),
     topic: Optional[str] = typer.Option(None, "--topic", "-t", help="Human-readable topic description"),
+    generate_overviews: bool = typer.Option(
+        False, "--generate-overviews", "-g",
+        help="Generate AI overviews for all papers in the wing (uses browser automation)",
+    ),
+    secret: Optional[str] = typer.Option(
+        None, "--secret",
+        help="Path to SECRET.md with alphaxiv credentials (default: SECRET.md in project root)",
+    ),
+    headless: bool = typer.Option(
+        True, "--headless/--no-headless",
+        help="Run the overview- generation browser in headless mode (default: headless)",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ):
     """
@@ -224,10 +240,20 @@ def start(
     Seeds the wing with the given papers, placing each one into the
     appropriate halls of the palace.
 
+    With --generate-overviews (-g), will automatically generate AI overviews
+    for ALL papers in the wing (not just seed papers), with a 5-second delay
+    between each to avoid rate limits.
+
     Example
     -------
-      axiv research start score-matching 2011.13456 2206.00364 --topic "Score-based generative models"
+      axiv research start score- matching 2011.13456 2206.00364 --topic "Score- based generative models"
+      axiv research start score-matching 2011.13456 2206.00364 -g  # generate overviews
     """
+    from alphaxiv_cli.overview_generator import (
+        ensure_overview_generated, is_playwright_available, is_session_valid,
+    )
+    from alphaxiv_cli.utils.helpers import extract_version_id
+
     topic_str = topic or wing.replace("-", " ")
     create_wing(wing, topic_str, _palace_db())
 
@@ -236,7 +262,24 @@ def start(
     console.print(f"\n[bold cyan]{action} research wing:[/bold cyan] {wing}")
     console.print(f"[dim]Topic: {topic_str}[/dim]\n")
 
+    secret_path = Path(secret) if secret else (_ctx().root / "SECRET.md")
+    secret_exists = secret_path.exists()
+    has_playwright = is_playwright_available()
+
+    if generate_overviews:
+        if not has_playwright:
+            console.print(f"[yellow]Playwright not installed - overview generation disabled.[/yellow]")
+            console.print(f"  [dim]pip install playwright && playwright install chromium[/dim]")
+            generate_overviews = False
+        elif not secret_exists and not _has_env_creds() and not is_session_valid():
+            console.print(f"[yellow]No credentials found and no saved session - overview generation disabled.[/yellow]")
+            console.print(f"  [dim]Run `axiv login`, create SECRET.md, or set ALPHAXIV_EMAIL / ALPHAXIV_PASSWORD[/dim]")
+            generate_overviews = False
+        else:
+            console.print(f"[dim]Overview generation: enabled (headless={headless})[/dim]\n")
+
     ok = 0
+    generated = 0
     seed_set = set(paper_ids)
     with AlphaXivClient() as client:
         with Progress(
@@ -250,8 +293,6 @@ def start(
             for pid in paper_ids:
                 if _ingest_paper(client, wing, pid, verbose):
                     ok += 1
-                    # Record tunnels between seed papers that appear in each
-                    # other's similar-papers list — connects the seeds visually
                     try:
                         similar = client.get_similar_papers(pid, limit=20)
                         for sp in similar:
@@ -263,6 +304,61 @@ def start(
                 progress.advance(task)
 
     console.print(f"\n[bold green]✓ {ok}/{len(paper_ids)} papers added to wing '{wing}'[/bold green]")
+
+    if generate_overviews:
+        all_rooms = list_rooms(wing, _palace_db())
+        papers_need_overviews = {}  # {paper_id: version_id}
+
+        console.print(f"\n[dim]Checking which papers need overviews…[/dim]")
+        with AlphaXivClient() as client:
+            for r in all_rooms:
+                pid = r["paper_id"]
+                try:
+                    info = client.resolve_paper(pid)
+                    version_id = extract_version_id(info) if info else None
+                    if version_id:
+                        try:
+                            overview = client.get_overview(version_id, use_cache=False)
+                            if has_overview_content(overview):
+                                continue
+                        except AlphaXivError:
+                            pass
+                        papers_need_overviews[pid] = version_id
+                except AlphaXivError:
+                    pass
+
+        if papers_need_overviews:
+            console.print(f"\n[bold cyan]Triggering overview generation for {len(papers_need_overviews)} papers…[/bold cyan]\n")
+
+            with AlphaXivClient() as client:
+                for pid, version_id in papers_need_overviews.items():
+                    console.print(f"  [yellow]⟳[/yellow] {pid} - triggering overview generation…")
+                    ok = ensure_overview_generated(
+                        pid, version_id, client,
+                        secret_file=str(secret_path) if secret_exists else None,
+                        headless=headless,
+                    )
+                    if ok:
+                        generated += 1
+                    time.sleep(5)
+
+        if papers_need_overviews:
+            console.print(f"\n[bold cyan]Waiting for overviews to generate...[/bold cyan]")
+            console.print(f"[dim]Background polling started (max 10 min). Press Ctrl+C to skip.\n[/dim]")
+
+            done_event = threading.Event()
+            poll_thread = threading.Thread(
+                target=_poll_overviews_background,
+                args=(papers_need_overviews, None, done_event),
+                daemon=True,
+            )
+            poll_thread.start()
+            poll_thread.join(timeout=600)
+            done_event.set()
+            console.print(f"\n[dim]Polling complete.[/dim]\n")
+
+    if generate_overviews and generated > 0:
+        console.print(f"[bold green]✓ Triggered {generated} overview(s) for wing '{wing}'[/bold green]")
     console.print(f"\nNext steps:")
     console.print(f"  axiv research expand {wing}            # BFS-expand one hop")
     console.print(f"  axiv research query {wing} '<question>'  # semantic search")
@@ -1173,6 +1269,49 @@ def _fork_link(
     console.print(f"  Check when done: [dim]axiv research room {wing} --linked[/dim]\n")
 
 
+def _poll_overviews_background(
+    pending: dict,  # {paper_id: version_id}
+    client,
+    done_event,
+    check_interval: int = 10,
+    max_wait: int = 600,
+):
+    """Background thread that polls for overview completion.
+
+    If *client* is None, creates its own AlphaXivClient for the duration.
+    """
+    import time as _time
+    start_time = _time.time()
+    completed = set()
+
+    own_client = client is None
+    if own_client:
+        client = AlphaXivClient()
+
+    try:
+        while not done_event.is_set() and (_time.time() - start_time) < max_wait:
+            for pid, version_id in list(pending.items()):
+                if pid in completed:
+                    continue
+                try:
+                    ov = client.get_overview(version_id, use_cache=False)
+                    if has_overview_content(ov):
+                        completed.add(pid)
+                        console.print(f"  [green]v[/green] {pid} - overview ready")
+                except Exception:
+                    pass
+
+            if completed == set(pending.keys()):
+                break
+            _time.sleep(check_interval)
+    finally:
+        if own_client:
+            client.close()
+
+    if completed:
+        console.print(f"\n[bold green]v {len(completed)} overviews ready[/bold green]")
+
+
 def _run_link(
     wing: str, output_dir: str, limit: int, relink: bool,
     secret_path: Path, headless: bool, verbose: bool,
@@ -1188,7 +1327,7 @@ def _run_link(
         build_note, get_arxiv_categories, sanitize_paper_id,
     )
     from alphaxiv_cli.overview_generator import (
-        ensure_overview_generated, is_playwright_available,
+        ensure_overview_generated, is_playwright_available, is_session_valid,
     )
     from alphaxiv_cli.utils.helpers import extract_version_id
 
@@ -1207,25 +1346,80 @@ def _run_link(
 
     has_playwright = is_playwright_available()
     secret_exists  = secret_path.exists()
+    has_session    = is_session_valid() if has_playwright else False
 
     console.print(f"\n[bold cyan]Linking wing:[/bold cyan] {wing}")
     console.print(f"  {len(all_rooms_list)} rooms total, {len(to_link)} to generate")
     if not has_playwright:
-        console.print(f"  [yellow]Playwright not installed — papers without overviews will be skipped.[/yellow]")
+        console.print(f"  [yellow]Playwright not installed -- papers without overviews will be skipped.[/yellow]")
         console.print(f"  [dim]pip install playwright && playwright install chromium[/dim]")
-    elif not secret_exists:
+    elif not secret_exists and not _has_env_creds() and not has_session:
         console.print(
-            f"  [yellow]No credentials found at {secret_path} — "
+            f"  [yellow]No credentials found and no saved session -- "
             f"papers without overviews will be skipped.[/yellow]"
         )
-        console.print(f"  [dim]Create SECRET.md or set ALPHAXIV_EMAIL / ALPHAXIV_PASSWORD[/dim]")
+        console.print(f"  [dim]Run `axiv login`, create SECRET.md, or set ALPHAXIV_EMAIL / ALPHAXIV_PASSWORD[/dim]")
+    elif has_session:
+        console.print(f"  [dim]Using saved browser session  |  headless: {headless}[/dim]")
     else:
         console.print(f"  [dim]Credentials: {secret_path}  |  headless: {headless}[/dim]")
     console.print()
 
     linked = skipped = generated = 0
+    pending_overviews = {}  # {paper_id: version_id}
 
     with AlphaXivClient() as client:
+        console.print(f"\n[dim]Phase 1: Triggering overview generation...[/dim]\n")
+        for r in to_link:
+            pid = r["paper_id"]
+            try:
+                info = client.resolve_paper(pid)
+                if not info:
+                    skipped += 1
+                    continue
+
+                version_id = extract_version_id(info)
+                if not version_id:
+                    skipped += 1
+                    continue
+
+                try:
+                    overview = client.get_overview(version_id)
+                    if overview and overview.get("overview"):
+                        continue
+                except AlphaXivError:
+                    pass
+
+                if has_playwright and (secret_exists or _has_env_creds()):
+                    console.print(f"  [yellow]⟳[/yellow] {pid} - triggering overview generation...")
+                    ok = ensure_overview_generated(
+                        pid, version_id, client,
+                        secret_file=secret_path if secret_exists else None,
+                        headless=headless,
+                    )
+                    if ok:
+                        pending_overviews[pid] = version_id
+                        generated += 1
+                    time.sleep(5)
+            except Exception as e:
+                logger.warning(f"Failed to trigger overview for {pid}: {e}")
+
+        if pending_overviews:
+            console.print(f"\n[bold cyan]Waiting for {len(pending_overviews)} overviews to generate...[/bold cyan]")
+            console.print(f"[dim]Background polling started. Press Ctrl+C to stop waiting.\n[/dim]")
+
+            done_event = threading.Event()
+            poll_thread = threading.Thread(
+                target=_poll_overviews_background,
+                args=(pending_overviews, client, done_event),
+                daemon=True,
+            )
+            poll_thread.start()
+            poll_thread.join(timeout=600)
+            done_event.set()
+
+            console.print(f"[dim]Polling complete, continuing with note generation...[/dim]\n")
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -1247,45 +1441,23 @@ def _run_link(
                     version_id = extract_version_id(info)
                     overview = None
 
-                    # --- try to get existing overview ---
                     if version_id:
                         try:
                             overview = client.get_overview(version_id)
                         except AlphaXivError:
                             pass
 
-                    # --- no overview: trigger generation via Playwright ---
-                    if (not overview or not overview.get("overview")) and version_id:
-                        if has_playwright and (secret_exists or _has_env_creds()):
-                            # Stop the live progress display before launching browser
-                            progress.stop()
-                            console.print(
-                                f"\n  [yellow]⟳[/yellow] {pid} — no overview yet, "
-                                f"requesting generation via browser…"
-                            )
-                            ok = ensure_overview_generated(
-                                pid, version_id, client,
-                                secret_file=secret_path if secret_exists else None,
-                                headless=headless,
-                            )
-                            progress.start()
-                            if ok:
-                                try:
-                                    overview = client.get_overview(version_id)
-                                    generated += 1
-                                except AlphaXivError:
-                                    pass
-
-                    # --- still no overview: skip ---
-                    if not overview or not overview.get("overview"):
+                    if not has_overview_content(overview):
                         if verbose:
                             console.print(f"  [dim]skip {pid} — overview unavailable[/dim]")
                         skipped += 1
                         progress.advance(task)
                         continue
 
-                    # --- build and write note ---
-                    similar = client.get_similar_papers(pid, limit)
+                    try:
+                        similar = client.get_similar_papers(pid, limit)
+                    except Exception:
+                        similar = []
                     cats    = get_arxiv_categories(pid)
                     note_md, report_md = build_note(
                         pid, info, overview, similar, today,
@@ -1334,6 +1506,262 @@ def _has_env_creds() -> bool:
     """Return True if ALPHAXIV_EMAIL / ALPHAXIV_PASSWORD are set in the environment."""
     import os
     return bool(os.getenv("ALPHAXIV_EMAIL") and os.getenv("ALPHAXIV_PASSWORD"))
+
+
+# ---------------------------------------------------------------------------
+# trim  -- remove least-related papers from a wing via similarity check
+# ---------------------------------------------------------------------------
+
+@app.command()
+def trim(
+    wing: str = typer.Argument(..., help="Wing to trim", autocompletion=_complete_wing),
+    keep: int = typer.Option(0, "--keep", "-k", help="Number of papers to keep (0 = interactive)"),
+    threshold: float = typer.Option(
+        0.0, "--threshold", "-t",
+        help="Remove papers with avg similarity score below this (0-1, 0 = disabled)",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be removed without deleting"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+):
+    """
+    Trim a wing by removing the least-related papers.
+
+    Uses ChromaDB embeddings to compute pairwise similarity between all
+    papers in the wing.  Papers are ranked by average similarity to the
+    rest of the wing -- the lowest-scoring papers are candidates for removal.
+
+    Three modes:
+      --keep N       Keep the top N most-related papers, remove the rest.
+      --threshold T  Remove papers whose average similarity < T (0-1 scale).
+      (neither)      Interactive: show the ranking and let you pick.
+
+    Example
+    -------
+      axiv research trim diffusion-models --keep 10
+      axiv research trim diffusion-models --threshold 0.6 --dry-run
+      axiv research trim diffusion-models   # interactive mode
+    """
+    w = get_wing(wing, _palace_db())
+    if not w:
+        console.print(f"[red]Wing '{wing}' not found.[/red]")
+        raise typer.Exit(1)
+
+    all_rooms_list = list_rooms(wing, _palace_db())
+    if len(all_rooms_list) < 3:
+        console.print(f"[yellow]Wing '{wing}' has only {len(all_rooms_list)} paper(s) -- nothing to trim.[/yellow]")
+        return
+
+    console.print(f"\n[bold cyan]Trimming wing:[/bold cyan] {wing}  ({len(all_rooms_list)} papers)\n")
+
+    # -- Compute similarity scores via ChromaDB embeddings --
+    scores = _compute_wing_similarity(wing, all_rooms_list, verbose)
+    if not scores:
+        console.print("[red]Could not compute similarity scores (ChromaDB may be empty for this wing).[/red]")
+        console.print(f"  Try running: axiv research start {wing} <paper_ids>  to re-index.")
+        raise typer.Exit(1)
+
+    # Sort by score ascending (least similar first)
+    ranked = sorted(scores.items(), key=lambda x: x[1])
+
+    # Display ranking table
+    table = Table(
+        "Rank", "Paper ID", "Title", "Avg Similarity",
+        show_header=True, header_style="bold magenta", show_lines=False,
+    )
+    room_map = {r["paper_id"]: r for r in all_rooms_list}
+    for i, (pid, score) in enumerate(ranked, 1):
+        title = room_map.get(pid, {}).get("title", "?")[:55]
+        style = "red" if score < 0.5 else ("yellow" if score < 0.7 else "green")
+        table.add_row(str(i), pid, title, f"[{style}]{score:.3f}[/{style}]")
+    console.print(table)
+    console.print()
+
+    # -- Determine which papers to remove --
+    to_remove = []
+    if keep > 0:
+        # Keep top N, remove the rest
+        if keep >= len(ranked):
+            console.print(f"[yellow]--keep {keep} >= total papers ({len(ranked)}), nothing to remove.[/yellow]")
+            return
+        to_remove = [pid for pid, _ in ranked[:len(ranked) - keep]]
+    elif threshold > 0:
+        to_remove = [pid for pid, score in ranked if score < threshold]
+    else:
+        # Interactive mode
+        to_remove = _interactive_trim(ranked, room_map)
+
+    if not to_remove:
+        console.print("[dim]No papers selected for removal.[/dim]\n")
+        return
+
+    # -- Confirm and remove --
+    console.print(f"\n[bold]Papers to remove ({len(to_remove)}):[/bold]")
+    for pid in to_remove:
+        title = room_map.get(pid, {}).get("title", "?")[:60]
+        score = scores.get(pid, 0)
+        console.print(f"  [red]x[/red] {pid}  (sim={score:.3f})  {title}")
+
+    if dry_run:
+        console.print(f"\n[yellow]Dry run -- no papers were removed.[/yellow]\n")
+        return
+
+    if not yes:
+        try:
+            import questionary
+            confirmed = questionary.confirm(
+                f"Remove {len(to_remove)} paper(s) from wing '{wing}'?",
+                default=False,
+            ).ask()
+        except ImportError:
+            console.print(f"\n[dim]Confirm removal of {len(to_remove)} papers? [y/N][/dim] ", end="")
+            confirmed = input().strip().lower() in ("y", "yes")
+
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]\n")
+            return
+
+    removed = 0
+    for pid in to_remove:
+        ok = remove_paper_from_wing(wing, pid, _palace_db())
+        remove_paper_from_chroma(wing, pid, _palace_dir())
+        if ok:
+            removed += 1
+            if verbose:
+                console.print(f"  [red]x[/red] removed {pid}")
+
+    console.print(
+        f"\n[bold green]Trimmed {removed} paper(s) from wing '{wing}'[/bold green]  "
+        f"({len(all_rooms_list) - removed} remaining)\n"
+    )
+
+
+def _compute_wing_similarity(
+    wing: str,
+    rooms: list[dict],
+    verbose: bool = False,
+) -> dict[str, float]:
+    """
+    Compute average pairwise similarity for each paper in a wing using
+    ChromaDB embeddings.
+
+    For each paper, queries ChromaDB with the paper's own text and
+    measures how close the other wing papers are.  Returns {paper_id: avg_similarity}
+    where similarity is in [0, 1] (1 = identical, 0 = unrelated).
+
+    ChromaDB returns squared-L2 distance in [0, 4]; we convert to similarity
+    as: sim = 1 - dist/2, clamped to [0, 1].
+    """
+    try:
+        from mempalace.palace import get_collection  # type: ignore
+    except ImportError:
+        logger.warning("mempalace not installed -- cannot compute similarity")
+        return {}
+
+    try:
+        col = get_collection(str(_palace_dir()))
+        if col.count() == 0:
+            return {}
+    except Exception as e:
+        logger.warning(f"Failed to access ChromaDB collection: {e}")
+        return {}
+
+    # Get all wing paper IDs and their stored documents
+    paper_ids = [r["paper_id"] for r in rooms]
+    doc_ids = [f"{wing}::{pid}" for pid in paper_ids]
+
+    try:
+        stored = col.get(ids=doc_ids, include=["documents"])
+    except Exception as e:
+        logger.warning(f"Failed to retrieve documents from ChromaDB: {e}")
+        return {}
+
+    # Build a map of which IDs actually exist in ChromaDB
+    existing_ids = set(stored["ids"]) if stored and stored["ids"] else set()
+    id_to_doc = {}
+    if stored and stored["ids"] and stored["documents"]:
+        for doc_id, doc in zip(stored["ids"], stored["documents"]):
+            if doc:
+                id_to_doc[doc_id] = doc
+
+    if len(id_to_doc) < 2:
+        if verbose:
+            console.print(f"[dim]Only {len(id_to_doc)} paper(s) in ChromaDB -- need at least 2.[/dim]")
+        return {}
+
+    # For each paper, query its text against the collection and compute
+    # average distance to other wing papers
+    n_wing = len(id_to_doc)
+    scores: dict[str, float] = {}
+
+    for pid in paper_ids:
+        doc_id = f"{wing}::{pid}"
+        if doc_id not in id_to_doc:
+            # Paper not in ChromaDB -- assign score 0 (most removable)
+            scores[pid] = 0.0
+            continue
+
+        doc_text = id_to_doc[doc_id]
+
+        try:
+            results = col.query(
+                query_texts=[doc_text],
+                n_results=min(n_wing + 5, col.count()),
+                where={"wing": {"$eq": wing}},
+                include=["distances", "metadatas"],
+            )
+        except Exception:
+            scores[pid] = 0.0
+            continue
+
+        # Average distance to other wing papers (skip self)
+        dists = []
+        if results and results["distances"] and results["metadatas"]:
+            for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
+                other_pid = meta.get("paper_id", "")
+                if other_pid and other_pid != pid:
+                    dists.append(dist)
+
+        if dists:
+            avg_dist = sum(dists) / len(dists)
+            # Convert squared-L2 distance [0, 4] to similarity [0, 1]
+            similarity = max(0.0, min(1.0, 1.0 - avg_dist / 2.0))
+            scores[pid] = round(similarity, 4)
+        else:
+            scores[pid] = 0.0
+
+    return scores
+
+
+def _interactive_trim(
+    ranked: list[tuple[str, float]],
+    room_map: dict[str, dict],
+) -> list[str]:
+    """Let the user pick which papers to remove via checkbox."""
+    try:
+        import questionary
+    except ImportError:
+        console.print("[dim]Install questionary for interactive trim: pip install questionary[/dim]")
+        console.print("[dim]Use --keep N or --threshold T instead.[/dim]\n")
+        return []
+
+    choices = [
+        questionary.Choice(
+            title=f"[sim={score:.3f}] {pid}  {room_map.get(pid, {}).get('title', '?')[:55]}",
+            value=pid,
+            checked=(score < 0.5),  # pre-check low-similarity papers
+        )
+        for pid, score in ranked
+    ]
+
+    console.print()
+    selected = questionary.checkbox(
+        "Select papers to REMOVE (pre-checked = low similarity):",
+        choices=choices,
+        instruction="(Space=toggle  Enter=confirm  Ctrl-C=cancel)",
+    ).ask()
+
+    return selected if selected else []
 
 
 # ---------------------------------------------------------------------------

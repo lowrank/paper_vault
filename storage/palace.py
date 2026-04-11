@@ -235,7 +235,7 @@ def add_paper_to_wing(
         if full_overview:
             hall_content["hall_methods"].append((
                 "overview_excerpt",
-                full_overview[:600],
+                full_overview[:2000],
             ))
 
         # hall_facts  → key citation summaries
@@ -298,7 +298,9 @@ def _extract_questions(text: str) -> list[str]:
 def _build_closet(title: str, abstract: str, summary: str, keywords: list) -> str:
     """Compact distilled summary pointing into the drawers."""
     kw_str = ", ".join(keywords[:6]) if keywords else "N/A"
-    body = summary if summary else abstract[:300]
+    body = summary if summary else abstract
+    if abstract and abstract[:400] not in (summary or ""):
+        body = f"{body} | {abstract}"
     return f"[{title}] topics={kw_str} | {body}"
 
 
@@ -471,6 +473,27 @@ def get_syntheses(wing_name: str, db_path: Path) -> list[dict]:
     except Exception as e:
         logger.warning(f"get_syntheses failed: {e}")
         return []
+
+
+def clear_syntheses(wing_name: str, db_path: Path, keep_latest: bool = False) -> int:
+    """Delete synthesis versions for a wing. Returns count deleted."""
+    try:
+        conn = _connect(db_path)
+        if keep_latest:
+            conn.execute("""
+                DELETE FROM synthesis WHERE wing_name=? AND id NOT IN (
+                    SELECT id FROM synthesis WHERE wing_name=? ORDER BY created_at DESC LIMIT 1
+                )
+            """, (wing_name, wing_name))
+        else:
+            conn.execute("DELETE FROM synthesis WHERE wing_name=?", (wing_name,))
+        deleted = conn.total_changes
+        conn.commit()
+        conn.close()
+        return deleted
+    except Exception as e:
+        logger.warning(f"clear_syntheses failed: {e}")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +736,63 @@ def list_rooms(wing_name: str, db_path: Path) -> list[dict]:
     except Exception as e:
         logger.warning(f"list_rooms failed: {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# Paper removal
+# ---------------------------------------------------------------------------
+
+def remove_paper_from_wing(wing_name: str, paper_id: str, db_path: Path) -> bool:
+    """
+    Remove a paper and all associated data from a wing.
+
+    Deletes from: rooms, drawers, closets, tunnels, note_links.
+    Also removes the paper's ChromaDB entry if possible.
+    Returns True if any rows were deleted, False otherwise.
+    """
+    try:
+        conn = _connect(db_path)
+        total = 0
+        for table, clause in [
+            ("rooms",      "wing_name=? AND paper_id=?"),
+            ("drawers",    "wing_name=? AND paper_id=?"),
+            ("closets",    "wing_name=? AND paper_id=?"),
+            ("note_links", "wing_name=? AND paper_id=?"),
+        ]:
+            cur = conn.execute(f"DELETE FROM {table} WHERE {clause}", (wing_name, paper_id))
+            total += cur.rowcount
+
+        # Tunnels reference from/to — remove both directions
+        cur = conn.execute(
+            "DELETE FROM tunnels WHERE "
+            "(from_wing=? AND from_paper=?) OR (to_wing=? AND to_paper=?)",
+            (wing_name, paper_id, wing_name, paper_id),
+        )
+        total += cur.rowcount
+
+        conn.commit()
+        conn.close()
+        return total > 0
+    except Exception as e:
+        logger.warning(f"remove_paper_from_wing failed for {paper_id}: {e}")
+        return False
+
+
+def remove_paper_from_chroma(wing_name: str, paper_id: str, palace_path: Path) -> bool:
+    """Remove a paper's ChromaDB entry from the palace collection."""
+    try:
+        from mempalace.palace import get_collection  # type: ignore
+        col = get_collection(str(palace_path))
+        doc_id = f"{wing_name}::{paper_id}"
+        # Check if the ID exists before attempting deletion
+        existing = col.get(ids=[doc_id])
+        if existing and existing["ids"]:
+            col.delete(ids=[doc_id])
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"remove_paper_from_chroma failed for {paper_id}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------

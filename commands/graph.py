@@ -14,7 +14,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 logger = logging.getLogger(__name__)
 
-from alphaxiv_cli.client import AlphaXivClient, AlphaXivError
+from alphaxiv_cli.client import AlphaXivClient, AlphaXivError, has_overview_content
 from alphaxiv_cli.overview_generator import ensure_overview_generated, is_session_valid
 from alphaxiv_cli.utils.helpers import extract_version_id
 from alphaxiv_cli.config import DEFAULT_CACHE_DIR
@@ -112,9 +112,14 @@ def extract_keywords(overview: Optional[dict], paper_info: Optional[dict] = None
                 if isinstance(tip, dict) and 'name' in tip:
                     topics.append(tip['name'])
     if not topics:
+        summary_text = ''
+        if isinstance((overview or {}).get('summary'), dict):
+            summary_text = (overview or {}).get('summary', {}).get('summary', '')
+        if not summary_text:
+            summary_text = (overview or {}).get('intermediateReport', '') or ''
         topics = _keywords_from_text(
             (paper_info or {}).get('title', ''),
-            ((overview or {}).get('summary') or {}).get('summary', '') if isinstance((overview or {}).get('summary'), dict) else '',
+            summary_text[:2000],
         )
     return list(dict.fromkeys(t for t in topics if t))[:10]
 
@@ -213,31 +218,39 @@ def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path
 
 
 def sanitize_paper_id(paper_id: str) -> str:
+    if not paper_id:
+        return "unknown"
     safe_id = re.sub(r'[^\w\-\.]', '_', paper_id)
     return safe_id[:255]
 
 
 def get_arxiv_categories(paper_id: str) -> list:
+    import time
     cache_key = f"arxiv_cats:{paper_id}"
     cached = _cat_cache.get(cache_key)
     if cached is not None:
         return cached
-    try:
-        r = httpx.get(f"https://arxiv.org/abs/{paper_id}", timeout=10)
-        labels = re.findall(r'<span class="primary-subject">([^<]+)</span>', r.text)
-        labels += re.findall(r'<span class="secondary-subject">([^<]+)</span>', r.text)
-        codes = re.findall(r'context=([a-z]+\.[A-Z]+)', r.text)
-        # also extract short codes embedded in labels like "Analysis of PDEs (math.AP)"
-        for label in labels:
-            m = re.search(r'\(([a-z]+\.[A-Z]+)\)', label)
-            if m:
-                codes.append(m.group(1))
-        result = list(dict.fromkeys(codes))
-        _cat_cache.set(cache_key, result)
-        return result
-    except Exception as e:
-        logger.debug(f"Failed to fetch arxiv categories for {paper_id}: {e}")
-        return []
+    for attempt in range(3):
+        try:
+            r = httpx.get(f"https://arxiv.org/abs/{paper_id}", timeout=15)
+            if r.status_code == 429:
+                time.sleep(2 ** attempt)
+                continue
+            labels = re.findall(r'<span class="primary-subject">([^<]+)</span>', r.text)
+            labels += re.findall(r'<span class="secondary-subject">([^<]+)</span>', r.text)
+            codes = re.findall(r'context=([a-z]+\.[A-Z]+)', r.text)
+            # also extract short codes embedded in labels like "Analysis of PDEs (math.AP)"
+            for label in labels:
+                m = re.search(r'\(([a-z]+\.[A-Z]+)\)', label)
+                if m:
+                    codes.append(m.group(1))
+            result = list(dict.fromkeys(codes))
+            _cat_cache.set(cache_key, result)
+            return result
+        except Exception as e:
+            logger.debug(f"Failed to fetch arxiv categories for {paper_id}: {e}")
+            time.sleep(1)
+    return []
 
 
 def build_graph(
@@ -307,7 +320,8 @@ def build_graph(
                     pass
 
                 # --- no overview: try generation if session is valid ---
-                if (not overview or not overview.get("overview")) and session_ok:
+                has_overview = has_overview_content(overview)
+                if not has_overview and session_ok:
                     progress.stop()
                     if verbose:
                         print(f"  Requesting overview generation for {paper_id}…")
@@ -321,7 +335,8 @@ def build_graph(
                         except Exception:
                             pass
 
-                if not overview or not overview.get("overview"):
+                has_overview = has_overview_content(overview)
+                if not has_overview:
                     pending[paper_id] = {
                         "title": info.get("title", ""),
                         "reason": "no_session" if not session_ok else "generation_failed",
@@ -397,7 +412,9 @@ def build_graph(
 
 
 def _arxiv_id_from_link(link: str) -> Optional[str]:
-    """Extract arXiv ID from an alphaxiv URL like https://alphaxiv.org/abs/1503.03585."""
+    """Extract arXiv ID from an alphaxiv URL like https://alphaxiv.Org/abs/15.03044v3."""
+    if not link:
+        return None
     m = re.search(r"/abs/([0-9]{4}\.[0-9]+)", link)
     return m.group(1) if m else None
 
@@ -419,7 +436,7 @@ def build_note(paper_id, info, overview, similar, today, db, images_dir, downloa
     citations = overview.get('citations', [])
     keywords = extract_keywords(overview, info)
     
-    all_tags = list(dict.fromkeys(categories or []))
+    all_tags = [c.replace('.', '-') for c in dict.fromkeys(categories or [])]
     
     report_link = f"> [!tip] See Also\n> [[./reports/{paper_id}_report.md|Intermediate Report]]" if has_report else ""
     
@@ -440,7 +457,7 @@ arxiv: {paper_id}
 > {abstract}
 
 ## Full Overview
-{full_overview if full_overview else 'N/A'}
+{full_overview if full_overview else (intermediate if intermediate else 'N/A')}
 
 ## Key Citations
 

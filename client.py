@@ -4,7 +4,6 @@
 import httpx
 import time
 import hashlib
-import asyncio
 from typing import Optional, Dict, List, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,6 +20,51 @@ def _encode_id(paper_id: str) -> str:
     makes the whole ID a single path segment as intended.
     """
     return _urlquote(paper_id, safe="")
+
+def has_overview_content(overview: Optional[Dict[str, Any]]) -> bool:
+    """Return True if *overview* contains usable AI-generated content.
+
+    The AlphaXiv API may populate any of three fields depending on how far
+    the generation pipeline has progressed:
+
+    * ``overview``            -- the final rendered overview text/dict
+    * ``summary``             -- a shorter summary (sometimes available first)
+    * ``intermediateReport``  -- a detailed report generated during extraction
+
+    A paper whose status is still ``extracting`` may already have an
+    ``intermediateReport`` and should be treated as *done*.
+    """
+    if not overview:
+        return False
+    if overview.get("overview"):
+        return True
+    if overview.get("summary"):
+        return True
+    if overview.get("intermediateReport"):
+        return True
+    return False
+
+
+def extract_overview_text(overview: Optional[Dict[str, Any]]) -> str:
+    """Extract the best available text from an overview response.
+
+    Priority: overview > intermediateReport > summary > empty string.
+    """
+    if not overview:
+        return ""
+    ov = overview.get("overview")
+    if ov:
+        return ov if isinstance(ov, str) else str(ov)
+    ir = overview.get("intermediateReport")
+    if ir:
+        return ir if isinstance(ir, str) else str(ir)
+    summary = overview.get("summary")
+    if summary:
+        if isinstance(summary, dict):
+            return summary.get("summary", "")
+        return str(summary)
+    return ""
+
 
 from alphaxiv_cli.storage.cache import Cache
 from alphaxiv_cli.config import BASE_API_URL, USER_AGENT, DEFAULT_CACHE_DIR, DEFAULT_CACHE_TTL_HOURS, DEFAULT_TIMEOUT, DEFAULT_MAX_RETRIES
