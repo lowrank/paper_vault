@@ -29,8 +29,6 @@ with richer wing/hall metadata so searches are much more precise.
 
 import json
 import logging
-import sys
-import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -38,8 +36,8 @@ from pathlib import Path
 from typing import Optional, List
 
 import typer
-from rich import print as rprint
 from rich.console import Console
+from rich.live import Live
 from rich.markup import escape as markup_escape
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -250,7 +248,7 @@ def start(
       axiv research start score-matching 2011.13456 2206.00364 -g  # generate overviews
     """
     from alphaxiv_cli.overview_generator import (
-        ensure_overview_generated, is_playwright_available, is_session_valid,
+        trigger_overviews_batch, is_playwright_available, is_session_valid,
     )
     from alphaxiv_cli.utils.helpers import extract_version_id
 
@@ -330,35 +328,34 @@ def start(
         if papers_need_overviews:
             console.print(f"\n[bold cyan]Triggering overview generation for {len(papers_need_overviews)} papers…[/bold cyan]\n")
 
+            def _on_progress(pid, status):
+                if status == "rate_limited":
+                    console.print(f"  [yellow]![/yellow] {pid} - rate-limited, backing off...")
+                elif status == "ok":
+                    console.print(f"  [green]v[/green] {pid} - triggered")
+                else:
+                    console.print(f"  [red]x[/red] {pid} - failed")
+
             with AlphaXivClient() as client:
-                for pid, version_id in papers_need_overviews.items():
-                    console.print(f"  [yellow]⟳[/yellow] {pid} - triggering overview generation…")
-                    ok = ensure_overview_generated(
-                        pid, version_id, client,
-                        secret_file=str(secret_path) if secret_exists else None,
-                        headless=headless,
-                    )
-                    if ok:
-                        generated += 1
-                    time.sleep(5)
+                batch_results = trigger_overviews_batch(
+                    papers_need_overviews,
+                    client,
+                    secret_file=str(secret_path) if secret_exists else None,
+                    headless=headless,
+                    delay=120.0,
+                    on_progress=_on_progress,
+                )
+                generated = sum(1 for ok in batch_results.values() if ok)
 
-        if papers_need_overviews:
-            console.print(f"\n[bold cyan]Waiting for overviews to generate...[/bold cyan]")
-            console.print(f"[dim]Background polling started (max 10 min). Press Ctrl+C to skip.\n[/dim]")
-
-            done_event = threading.Event()
-            poll_thread = threading.Thread(
-                target=_poll_overviews_background,
-                args=(papers_need_overviews, None, done_event),
-                daemon=True,
-            )
-            poll_thread.start()
-            poll_thread.join(timeout=600)
-            done_event.set()
-            console.print(f"\n[dim]Polling complete.[/dim]\n")
+            if generated:
+                console.print(
+                    f"\n[bold green]v Triggered {generated} overview(s) -- "
+                    f"generation runs server-side.[/bold green]"
+                )
+                console.print(f"  [dim]Use `axiv research link {wing}` to generate notes once ready.[/dim]")
 
     if generate_overviews and generated > 0:
-        console.print(f"[bold green]✓ Triggered {generated} overview(s) for wing '{wing}'[/bold green]")
+        console.print(f"[bold green]v Triggered {generated} overview(s) for wing '{wing}'[/bold green]")
     console.print(f"\nNext steps:")
     console.print(f"  axiv research expand {wing}            # BFS-expand one hop")
     console.print(f"  axiv research query {wing} '<question>'  # semantic search")
@@ -497,10 +494,10 @@ def query(
         title    = r.get("title", "")
         doc      = r.get("document", "")
         dist     = r.get("distance")
-        hall     = r.get("hall", "")
+        result_hall = r.get("hall", "")
         # ChromaDB returns squared-L2 distance in [0,4]; convert to [0,1] similarity
         dist_str = f"  [dim]score={1 - dist/2:.2f}[/dim]" if isinstance(dist, float) else ""
-        hall_str = f"  [dim]{hall}[/dim]" if hall else ""
+        hall_str = f"  [dim]{result_hall}[/dim]" if result_hall else ""
 
         body = doc[:400] + "…" if len(doc) > 400 else doc
         console.print(Panel(
@@ -1269,48 +1266,6 @@ def _fork_link(
     console.print(f"  Check when done: [dim]axiv research room {wing} --linked[/dim]\n")
 
 
-def _poll_overviews_background(
-    pending: dict,  # {paper_id: version_id}
-    client,
-    done_event,
-    check_interval: int = 10,
-    max_wait: int = 600,
-):
-    """Background thread that polls for overview completion.
-
-    If *client* is None, creates its own AlphaXivClient for the duration.
-    """
-    import time as _time
-    start_time = _time.time()
-    completed = set()
-
-    own_client = client is None
-    if own_client:
-        client = AlphaXivClient()
-
-    try:
-        while not done_event.is_set() and (_time.time() - start_time) < max_wait:
-            for pid, version_id in list(pending.items()):
-                if pid in completed:
-                    continue
-                try:
-                    ov = client.get_overview(version_id, use_cache=False)
-                    if has_overview_content(ov):
-                        completed.add(pid)
-                        console.print(f"  [green]v[/green] {pid} - overview ready")
-                except Exception:
-                    pass
-
-            if completed == set(pending.keys()):
-                break
-            _time.sleep(check_interval)
-    finally:
-        if own_client:
-            client.close()
-
-    if completed:
-        console.print(f"\n[bold green]v {len(completed)} overviews ready[/bold green]")
-
 
 def _run_link(
     wing: str, output_dir: str, limit: int, relink: bool,
@@ -1327,7 +1282,7 @@ def _run_link(
         build_note, get_arxiv_categories, sanitize_paper_id,
     )
     from alphaxiv_cli.overview_generator import (
-        ensure_overview_generated, is_playwright_available, is_session_valid,
+        trigger_overviews_batch, is_playwright_available, is_session_valid,
     )
     from alphaxiv_cli.utils.helpers import extract_version_id
 
@@ -1366,10 +1321,65 @@ def _run_link(
     console.print()
 
     linked = skipped = generated = 0
-    pending_overviews = {}  # {paper_id: version_id}
+    can_trigger = has_playwright and (secret_exists or _has_env_creds() or has_session)
+
+    # -- Helper: generate a note for one paper ----------------------------------
+    def _link_one(pid, client, out_path, images_dir, reports_dir, limit, today, verbose):
+        """Build and write the Obsidian note for *pid*. Returns True on success."""
+        try:
+            info = client.resolve_paper(pid)
+            if not info:
+                return False
+            version_id = extract_version_id(info)
+            overview = None
+            if version_id:
+                try:
+                    overview = client.get_overview(version_id)
+                except AlphaXivError:
+                    pass
+            if not has_overview_content(overview):
+                return False
+
+            try:
+                similar = client.get_similar_papers(pid, limit)
+            except Exception:
+                similar = []
+            cats = get_arxiv_categories(pid)
+            note_md, report_md = build_note(
+                pid, info, overview, similar, today,
+                {}, images_dir, False, cats,
+            )
+
+            safe_id = sanitize_paper_id(pid)
+            note_path = out_path / f"{safe_id}.md"
+            note_path.write_text(note_md)
+
+            report_path = None
+            if report_md:
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                report_path = reports_dir / f"{safe_id}_report.md"
+                report_path.write_text(report_md)
+
+            set_note_link(
+                wing, pid,
+                note_path.resolve(),
+                report_path.resolve() if report_path else None,
+                _palace_db(),
+            )
+            if verbose:
+                console.print(f"  [green]v[/green] {pid}: {info.get('title','')[:55]}")
+            return True
+        except Exception as e:
+            logger.warning(f"link failed for {pid}: {e}")
+            return False
 
     with AlphaXivClient() as client:
-        console.print(f"\n[dim]Phase 1: Triggering overview generation...[/dim]\n")
+
+        # -- Phase 1: identify papers needing overviews -------------------------
+        console.print(f"\n[dim]Phase 1: Checking papers...[/dim]\n")
+        ready_pids = []          # already have overview content
+        needs_trigger = {}       # {paper_id: version_id} -- need generation
+
         for r in to_link:
             pid = r["paper_id"]
             try:
@@ -1377,125 +1387,179 @@ def _run_link(
                 if not info:
                     skipped += 1
                     continue
-
                 version_id = extract_version_id(info)
                 if not version_id:
                     skipped += 1
                     continue
-
                 try:
                     overview = client.get_overview(version_id)
-                    if overview and overview.get("overview"):
+                    if has_overview_content(overview):
+                        ready_pids.append(pid)
                         continue
                 except AlphaXivError:
                     pass
+                needs_trigger[pid] = version_id
+            except Exception:
+                skipped += 1
 
-                if has_playwright and (secret_exists or _has_env_creds()):
-                    console.print(f"  [yellow]⟳[/yellow] {pid} - triggering overview generation...")
-                    ok = ensure_overview_generated(
-                        pid, version_id, client,
-                        secret_file=secret_path if secret_exists else None,
-                        headless=headless,
-                    )
-                    if ok:
-                        pending_overviews[pid] = version_id
-                        generated += 1
-                    time.sleep(5)
-            except Exception as e:
-                logger.warning(f"Failed to trigger overview for {pid}: {e}")
+        console.print(
+            f"  {len(ready_pids)} ready, "
+            f"{len(needs_trigger)} need generation, "
+            f"{skipped} skipped"
+        )
 
-        if pending_overviews:
-            console.print(f"\n[bold cyan]Waiting for {len(pending_overviews)} overviews to generate...[/bold cyan]")
-            console.print(f"[dim]Background polling started. Press Ctrl+C to stop waiting.\n[/dim]")
-
-            done_event = threading.Event()
-            poll_thread = threading.Thread(
-                target=_poll_overviews_background,
-                args=(pending_overviews, client, done_event),
-                daemon=True,
+        # -- Phase 2: trigger overviews for papers that need them ---------------
+        pending_overviews = {}
+        if needs_trigger and can_trigger:
+            console.print(
+                f"\n[bold cyan]Triggering overview generation for "
+                f"{len(needs_trigger)} paper(s)...[/bold cyan]\n"
             )
-            poll_thread.start()
-            poll_thread.join(timeout=600)
-            done_event.set()
 
-            console.print(f"[dim]Polling complete, continuing with note generation...[/dim]\n")
+            def _on_trigger(pid, status):
+                if status == "rate_limited":
+                    console.print(f"  [yellow]![/yellow] {pid} - rate-limited, backing off...")
+                elif status == "ok":
+                    console.print(f"  [green]v[/green] {pid} - triggered")
+                else:
+                    console.print(f"  [red]x[/red] {pid} - failed")
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Generating notes…", total=len(to_link))
+            batch_results = trigger_overviews_batch(
+                needs_trigger,
+                client,
+                secret_file=secret_path if secret_exists else None,
+                headless=headless,
+                delay=120.0,
+                on_progress=_on_trigger,
+            )
+            for pid, ok in batch_results.items():
+                if ok:
+                    pending_overviews[pid] = needs_trigger[pid]
+                    generated += 1
+        elif needs_trigger:
+            console.print(
+                f"  [yellow]{len(needs_trigger)} paper(s) need overviews but "
+                f"no credentials/session available -- skipping.[/yellow]"
+            )
 
-            for r in to_link:
-                pid = r["paper_id"]
-                try:
-                    info = client.resolve_paper(pid)
-                    if not info:
+        # -- Phase 3: generate notes for papers that are already ready ----------
+        if ready_pids:
+            console.print(f"\n[dim]Phase 3: Generating notes for {len(ready_pids)} ready paper(s)...[/dim]\n")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Generating notes...", total=len(ready_pids))
+                for pid in ready_pids:
+                    if _link_one(pid, client, out_path, images_dir, reports_dir, limit, today, verbose):
+                        linked += 1
+                    else:
                         skipped += 1
-                        progress.advance(task)
-                        continue
+                    progress.advance(task)
 
-                    version_id = extract_version_id(info)
-                    overview = None
+        # -- Phase 4: poll pending overviews and generate notes as they arrive --
+        if pending_overviews:
+            max_wait = 600
+            check_interval = 10
+            total = len(pending_overviews)
 
-                    if version_id:
+            # Track status per paper: "pending" | "linking" | "done" | "failed" | "timeout"
+            status_map = {pid: "pending" for pid in pending_overviews}
+            start_time = time.time()
+
+            def _build_monitor_table():
+                """Build a Rich Table showing current state of each pending paper."""
+                elapsed = int(time.time() - start_time)
+                mins, secs = divmod(elapsed, 60)
+
+                n_done = sum(1 for s in status_map.values() if s == "done")
+                n_fail = sum(1 for s in status_map.values() if s == "failed")
+                n_pend = sum(1 for s in status_map.values() if s == "pending")
+                n_link = sum(1 for s in status_map.values() if s == "linking")
+
+                tbl = Table(
+                    title=f"Phase 4: Waiting for overviews  [{mins:02d}:{secs:02d} / 10:00]",
+                    title_style="bold cyan",
+                    expand=True,
+                    show_lines=False,
+                    padding=(0, 1),
+                )
+                tbl.add_column("Paper", style="dim", ratio=3)
+                tbl.add_column("Status", justify="center", ratio=1)
+
+                status_style = {
+                    "pending": "[yellow]waiting...[/yellow]",
+                    "linking": "[blue]generating note[/blue]",
+                    "done":    "[green]done[/green]",
+                    "failed":  "[red]failed[/red]",
+                    "timeout": "[yellow]timed out[/yellow]",
+                }
+                for pid in pending_overviews:
+                    tbl.add_row(pid, status_style.get(status_map[pid], status_map[pid]))
+
+                # Summary footer
+                bar_done = n_done
+                bar_total = total
+                pct = int(100 * bar_done / bar_total) if bar_total else 0
+                filled = int(20 * bar_done / bar_total) if bar_total else 0
+                bar = "[green]" + "=" * filled + "[/green]" + "[dim]" + "-" * (20 - filled) + "[/dim]"
+                summary = (
+                    f"  {bar}  {pct}%  "
+                    f"[green]{n_done} done[/green]  "
+                    + (f"[red]{n_fail} failed[/red]  " if n_fail else "")
+                    + (f"[yellow]{n_pend + n_link} pending[/yellow]  " if n_pend + n_link else "")
+                    + f"[dim]{mins:02d}:{secs:02d} elapsed[/dim]"
+                )
+                tbl.add_section()
+                tbl.add_row(summary, "")
+
+                return tbl
+
+            still_pending = dict(pending_overviews)
+
+            with Live(_build_monitor_table(), console=console, refresh_per_second=1) as live:
+                while still_pending and (time.time() - start_time) < max_wait:
+                    time.sleep(check_interval)
+
+                    # Poll all still-pending papers
+                    newly_ready = []
+                    for pid, vid in list(still_pending.items()):
                         try:
-                            overview = client.get_overview(version_id)
-                        except AlphaXivError:
+                            ov = client.get_overview(vid, use_cache=False)
+                            if has_overview_content(ov):
+                                newly_ready.append(pid)
+                        except Exception:
                             pass
 
-                    if not has_overview_content(overview):
-                        if verbose:
-                            console.print(f"  [dim]skip {pid} — overview unavailable[/dim]")
-                        skipped += 1
-                        progress.advance(task)
-                        continue
+                    # Generate notes for papers that just became ready
+                    for pid in newly_ready:
+                        del still_pending[pid]
+                        status_map[pid] = "linking"
+                        live.update(_build_monitor_table())
 
-                    try:
-                        similar = client.get_similar_papers(pid, limit)
-                    except Exception:
-                        similar = []
-                    cats    = get_arxiv_categories(pid)
-                    note_md, report_md = build_note(
-                        pid, info, overview, similar, today,
-                        {}, images_dir, False, cats,
-                    )
+                        if _link_one(pid, client, out_path, images_dir, reports_dir, limit, today, verbose):
+                            linked += 1
+                            status_map[pid] = "done"
+                        else:
+                            skipped += 1
+                            status_map[pid] = "failed"
+                        live.update(_build_monitor_table())
 
-                    safe_id   = sanitize_paper_id(pid)
-                    note_path = out_path / f"{safe_id}.md"
-                    note_path.write_text(note_md)
+                    # Refresh the table even if nothing changed (updates elapsed time)
+                    live.update(_build_monitor_table())
 
-                    report_path = None
-                    if report_md:
-                        reports_dir.mkdir(parents=True, exist_ok=True)
-                        report_path = reports_dir / f"{safe_id}_report.md"
-                        report_path.write_text(report_md)
-
-                    set_note_link(
-                        wing, pid,
-                        note_path.resolve(),
-                        report_path.resolve() if report_path else None,
-                        _palace_db(),
-                    )
-                    linked += 1
-
-                    if verbose:
-                        console.print(
-                            f"  [green]✓[/green] {pid}: {info.get('title','')[:55]}"
-                        )
-                    progress.update(task, description=f"[green]✓ {pid}")
-
-                except Exception as e:
-                    logger.warning(f"link failed for {pid}: {e}")
-                    skipped += 1
-
-                progress.advance(task)
+                # Mark anything still pending as timed out
+                if still_pending:
+                    for pid in still_pending:
+                        status_map[pid] = "timeout"
+                    live.update(_build_monitor_table())
+                    skipped += len(still_pending)
 
     console.print(
-        f"\n[bold green]✓ Linked {linked}/{len(to_link)}[/bold green]"
+        f"\n[bold green]v Linked {linked}/{len(to_link)}[/bold green]"
         + (f"  [yellow](generated {generated} new overview(s))[/yellow]" if generated else "")
         + (f"  [dim](skipped {skipped})[/dim]" if skipped else "")
     )
@@ -1553,6 +1617,9 @@ def trim(
         return
 
     console.print(f"\n[bold cyan]Trimming wing:[/bold cyan] {wing}  ({len(all_rooms_list)} papers)\n")
+
+    # -- Ensure all papers are indexed in ChromaDB (use abstract if no overview) --
+    _ensure_wing_indexed(wing, all_rooms_list, verbose)
 
     # -- Compute similarity scores via ChromaDB embeddings --
     scores = _compute_wing_similarity(wing, all_rooms_list, verbose)
@@ -1634,6 +1701,65 @@ def trim(
         f"\n[bold green]Trimmed {removed} paper(s) from wing '{wing}'[/bold green]  "
         f"({len(all_rooms_list) - removed} remaining)\n"
     )
+
+
+def _ensure_wing_indexed(
+    wing: str,
+    rooms: list[dict],
+    verbose: bool = False,
+) -> None:
+    """Make sure every paper in *wing* has a ChromaDB entry.
+
+    Papers that are already indexed are skipped.  For missing papers,
+    fetches the overview (or falls back to abstract) from the API and
+    upserts into ChromaDB so that ``trim`` can compute similarity.
+    """
+    from alphaxiv_cli.utils.helpers import extract_version_id
+
+    try:
+        from mempalace.palace import get_collection  # type: ignore
+    except ImportError:
+        return
+
+    try:
+        col = get_collection(str(_palace_dir()))
+    except Exception:
+        return
+
+    paper_ids = [r["paper_id"] for r in rooms]
+    doc_ids = [f"{wing}::{pid}" for pid in paper_ids]
+
+    try:
+        existing = col.get(ids=doc_ids, include=[])
+        existing_ids = set(existing["ids"]) if existing and existing["ids"] else set()
+    except Exception:
+        existing_ids = set()
+
+    missing = [pid for pid in paper_ids if f"{wing}::{pid}" not in existing_ids]
+    if not missing:
+        return
+
+    if verbose:
+        console.print(f"[dim]Indexing {len(missing)} paper(s) missing from ChromaDB...[/dim]")
+
+    with AlphaXivClient() as client:
+        for pid in missing:
+            try:
+                info = client.resolve_paper(pid)
+                if not info:
+                    continue
+                version_id = extract_version_id(info)
+                overview = None
+                if version_id:
+                    try:
+                        overview = client.get_overview(version_id)
+                    except AlphaXivError:
+                        pass
+                upsert_to_chroma(wing, pid, info, overview, _palace_dir())
+                if verbose:
+                    console.print(f"  [dim]indexed {pid}[/dim]")
+            except Exception as e:
+                logger.debug(f"Failed to index {pid}: {e}")
 
 
 def _compute_wing_similarity(

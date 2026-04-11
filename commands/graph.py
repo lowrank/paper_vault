@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Graph command - Build Obsidian notes from paper knowledge graph."""
+from __future__ import annotations
+
+import hashlib
 import logging
 import typer
 import json
 import sys
 import re
-import httpx
 from typing import Optional
 from collections import deque
 from datetime import datetime
@@ -22,7 +24,15 @@ from alphaxiv_cli.context import get_context
 from alphaxiv_cli.storage.memory import upsert_paper, add_citation_triple, add_topic_triple
 from alphaxiv_cli.storage.cache import Cache
 
-_cat_cache = Cache(cache_dir=DEFAULT_CACHE_DIR, ttl_hours=24 * 30)
+_cat_cache: Optional[Cache] = None
+
+
+def _get_cat_cache() -> Cache:
+    """Lazily initialise the category cache (avoids mkdir at import time)."""
+    global _cat_cache
+    if _cat_cache is None:
+        _cat_cache = Cache(cache_dir=DEFAULT_CACHE_DIR, ttl_hours=24 * 30)
+    return _cat_cache
 
 app = typer.Typer(name="graph", help="Build Obsidian knowledge graph")
 
@@ -136,9 +146,8 @@ _STOPWORDS = {
 }
 
 def _keywords_from_text(title: str, summary: str) -> list:
-    import re as _re
     combined = f"{title}. {summary}"
-    words = _re.findall(r'\b[A-Za-z][a-z]{2,}\b', combined)
+    words = re.findall(r'\b[A-Za-z][a-z]{2,}\b', combined)
     
     bigrams = []
     for i in range(len(words) - 1):
@@ -156,7 +165,7 @@ def _keywords_from_text(title: str, summary: str) -> list:
 
 def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path) -> str:
     """Download images from markdown and update references."""
-    import httpx
+    import httpx as _httpx
     
     img_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
     matches = re.findall(img_pattern, markdown)
@@ -176,7 +185,7 @@ def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path
     for alt_text, url in matches:
         if url.startswith('http'):
             try:
-                resp = httpx.get(url, timeout=30, follow_redirects=True)
+                resp = _httpx.get(url, timeout=30, follow_redirects=True)
                 if resp.status_code == 200:
                     content_type = resp.headers.get('content-type', '').lower()
                     
@@ -198,7 +207,7 @@ def download_images_from_markdown(markdown: str, paper_id: str, images_dir: Path
                     }
                     ext = ext_map.get(content_type, Path(url).suffix or '.png')
                     
-                    safe_name = re.sub(r'[^\w\-]', '_', alt_text[:30]) if alt_text else f"img_{hash(url) % 10000}"
+                    safe_name = re.sub(r'[^\w\-]', '_', alt_text[:30]) if alt_text else f"img_{hashlib.md5(url.encode()).hexdigest()[:8]}"
                     filename = f"{safe_name}{ext}"
                     img_path = paper_images_dir / filename
                     
@@ -225,14 +234,16 @@ def sanitize_paper_id(paper_id: str) -> str:
 
 
 def get_arxiv_categories(paper_id: str) -> list:
+    import httpx as _httpx
     import time
+    cache = _get_cat_cache()
     cache_key = f"arxiv_cats:{paper_id}"
-    cached = _cat_cache.get(cache_key)
+    cached = cache.get(cache_key)
     if cached is not None:
         return cached
     for attempt in range(3):
         try:
-            r = httpx.get(f"https://arxiv.org/abs/{paper_id}", timeout=15)
+            r = _httpx.get(f"https://arxiv.org/abs/{paper_id}", timeout=15)
             if r.status_code == 429:
                 time.sleep(2 ** attempt)
                 continue
@@ -245,7 +256,7 @@ def get_arxiv_categories(paper_id: str) -> list:
                 if m:
                     codes.append(m.group(1))
             result = list(dict.fromkeys(codes))
-            _cat_cache.set(cache_key, result)
+            cache.set(cache_key, result)
             return result
         except Exception as e:
             logger.debug(f"Failed to fetch arxiv categories for {paper_id}: {e}")
@@ -457,7 +468,7 @@ arxiv: {paper_id}
 > {abstract}
 
 ## Full Overview
-{full_overview if full_overview else (intermediate if intermediate else 'N/A')}
+{intermediate if intermediate else (full_overview if full_overview else 'N/A')}
 
 ## Key Citations
 

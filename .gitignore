@@ -24,6 +24,19 @@ SECRET.md
 
 # Browser automation
 .alphaxiv/browser-profile-login/
+browser-profile/
+
+# Node (unused — vestigial package.json)
+node_modules/
+package.json
+package-lock.json
+
+# Data stores (local, not for VCS)
+*.sqlite3
+palace/
+
+# Session transcripts
+session-*.md
 
 # IDE
 .vscode/

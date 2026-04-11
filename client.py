@@ -2,6 +2,7 @@
 """AlphaXiv API Client."""
 
 import hashlib
+import json
 import httpx
 import logging
 import time
@@ -11,6 +12,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote as _urlquote
 
 logger = logging.getLogger(__name__)
+
+# HTTP status codes worth retrying (transient errors)
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 
 def _encode_id(paper_id: str) -> str:
@@ -51,16 +55,16 @@ def has_overview_content(overview: Optional[Dict[str, Any]]) -> bool:
 def extract_overview_text(overview: Optional[Dict[str, Any]]) -> str:
     """Extract the best available text from an overview response.
 
-    Priority: overview > intermediateReport > summary > empty string.
+    Priority: intermediateReport > overview > summary > empty string.
     """
     if not overview:
         return ""
-    ov = overview.get("overview")
-    if ov:
-        return ov if isinstance(ov, str) else str(ov)
     ir = overview.get("intermediateReport")
     if ir:
         return ir if isinstance(ir, str) else str(ir)
+    ov = overview.get("overview")
+    if ov:
+        return ov if isinstance(ov, str) else str(ov)
     summary = overview.get("summary")
     if summary:
         if isinstance(summary, dict):
@@ -133,12 +137,14 @@ class AlphaXivClient:
                     def __init__(self, data):
                         self.status_code = 200
                         self._data = data
+                        self.headers: Dict[str, str] = {}
+                        self.text = json.dumps(data)
                     def json(self):
                         return self._data
+                    def raise_for_status(self):
+                        pass
                 return CachedResponse(cached)
         
-        _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
         for attempt in range(self.max_retries):
             try:
                 response = self._http_client.request(method, url, **kwargs)
@@ -178,39 +184,36 @@ class AlphaXivClient:
     def resolve_paper(self, paper_id: str) -> Optional[Dict[str, Any]]:
         """Resolve arXiv ID to paper info."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            return response.json()
+        except AlphaXivError:
             return None
-        
-        return response.json()
     
     def get_overview(self, version_id: str, language: str = "en", use_cache: bool = True) -> Optional[Dict[str, Any]]:
         """Fetch paper overview (AI-generated summary)."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/overview/{language}"
-        response = self._request("GET", url, use_cache=use_cache)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url, use_cache=use_cache)
+            return response.json()
+        except AlphaXivError:
             return None
-        
-        return response.json()
     
     def get_metrics(self, version_id: str) -> Optional[Dict[str, Any]]:
         """Fetch paper metrics."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/metrics"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            return response.json()
+        except AlphaXivError:
             return None
-        
-        return response.json()
     
     def get_full_text(self, version_id: str) -> Optional[str]:
         """Fetch paper full text."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/full-text"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+        except AlphaXivError:
             return None
         
         data = response.json()
@@ -224,33 +227,30 @@ class AlphaXivClient:
     def get_similar_papers(self, paper_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Fetch similar papers."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/similar-papers"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            papers = response.json()
+            return papers[:limit] if isinstance(papers, list) else []
+        except AlphaXivError:
             return []
-        
-        papers = response.json()
-        return papers[:limit] if isinstance(papers, list) else []
     
     def get_citations(self, paper_id: str) -> List[Dict[str, Any]]:
         """Fetch paper citations."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/citations"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            return response.json()
+        except AlphaXivError:
             return []
-        
-        return response.json()
     
     def get_references(self, paper_id: str) -> List[Dict[str, Any]]:
         """Fetch paper references."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(paper_id)}/references"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            return response.json()
+        except AlphaXivError:
             return []
-        
-        return response.json()
     
     def search(self, query: str, limit: int = 20, sort_by: str = "relevance") -> List[Dict[str, Any]]:
         """
@@ -343,22 +343,20 @@ class AlphaXivClient:
     def get_overview_status(self, version_id: str) -> Optional[Dict[str, Any]]:
         """Check overview generation status without fetching the full overview."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/overview/status"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            return response.json()
+        except AlphaXivError:
             return None
-        
-        return response.json()
     
     def get_resources(self, version_id: str) -> Optional[Dict[str, Any]]:
         """Fetch paper resources (implementations, datasets, etc.)."""
         url = f"{BASE_API_URL}/papers/v3/{_encode_id(version_id)}/resources"
-        response = self._request("GET", url)
-        
-        if response.status_code == 404:
+        try:
+            response = self._request("GET", url)
+            return response.json()
+        except AlphaXivError:
             return None
-        
-        return response.json()
     
     def request_ai_overview(self, paper_id: str, version_order: int = 1, language: str = "en") -> Optional[Dict[str, Any]]:
         """Request AI overview generation for a paper."""
@@ -367,12 +365,11 @@ class AlphaXivClient:
             "versionOrder": version_order,
             "language": language
         }
-        response = self._request("POST", url, json=data, use_cache=False)
-        
-        if response.status_code >= 400:
+        try:
+            response = self._request("POST", url, json=data, use_cache=False)
+            return response.json()
+        except AlphaXivError:
             return None
-        
-        return response.json()
     
     def close(self):
         """Close HTTP client and release connections."""

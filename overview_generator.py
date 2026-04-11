@@ -312,7 +312,10 @@ def load_credentials(secret_file: Optional[Path] = None) -> Tuple[Optional[str],
         return email, password
 
     if secret_file is None:
-        secret_file = Path.cwd() / "SECRET.md"
+        # Use the resolved workspace root, not cwd(), to avoid reading a
+        # malicious SECRET.md from an arbitrary working directory.
+        from alphaxiv_cli.context import get_context
+        secret_file = Path(get_context().root) / "SECRET.md"
     if not secret_file.exists():
         return None, None
 
@@ -338,6 +341,185 @@ def load_credentials(secret_file: Optional[Path] = None) -> Tuple[Optional[str],
 # Overview generation (called by `axiv research link` / `start -g`)
 # ---------------------------------------------------------------------------
 
+def _trigger_one_paper(page: "Page", paper_id: str, client, version_id: str) -> str:
+    """Navigate to a paper's overview page, click Generate, and verify.
+
+    Uses an already-open *page* (shared browser context).  After clicking
+    the button, polls the API for up to 15 seconds to confirm the backend
+    acknowledged the request (status changes from None to something).
+
+    Returns
+    -------
+    str
+        ``"ok"`` if triggered/already exists, ``"rate_limited"`` if the site
+        showed a rate-limit message, or ``"failed"`` otherwise.
+    """
+    from alphaxiv_cli.client import has_overview_content
+
+    # Already has content? Skip.
+    try:
+        ov = client.get_overview(version_id, use_cache=False)
+        if has_overview_content(ov):
+            logger.debug(f"{paper_id}: overview already exists, skipping")
+            return "ok"
+    except Exception:
+        pass
+
+    try:
+        page.goto(
+            f"{ALPHAXIV_WEB_URL}/overview/{paper_id}",
+            wait_until="load",
+            timeout=30_000,
+        )
+        page.wait_for_timeout(3_000)
+    except Exception as e:
+        logger.debug(f"{paper_id}: page load failed: {e}")
+        return "failed"
+
+    # Try to click a generate button
+    clicked = False
+    for label in ("Generate", "generate", "Create overview", "Request"):
+        try:
+            btn = page.locator(f'button:has-text("{label}")').first
+            if btn.is_visible(timeout=3_000):
+                btn.click()
+                page.wait_for_timeout(2_000)
+                clicked = True
+                break
+        except Exception:
+            pass
+
+    if not clicked:
+        logger.debug(f"{paper_id}: no generate button found (may already be queued)")
+        # Still check API -- generation might already be in progress
+        try:
+            status = client.get_overview_status(version_id)
+            if status and status.get("state"):
+                return "ok"
+        except Exception:
+            pass
+        return "failed"
+
+    # Check for rate-limit toast/notification in the page after clicking.
+    # AlphaXiv shows messages like "generating blogs too quickly" as toasts.
+    _rate_limit_detected = False
+    try:
+        body_text = page.inner_text("body", timeout=2_000).lower()
+        _rate_phrases = ["too quickly", "rate limit", "try again", "wait a moment", "please wait"]
+        for phrase in _rate_phrases:
+            if phrase in body_text:
+                _rate_limit_detected = True
+                logger.warning(
+                    f"{paper_id}: rate-limit detected ('{phrase}' found in page)"
+                )
+                break
+    except Exception:
+        pass
+
+    if _rate_limit_detected:
+        return "rate_limited"
+
+    # Verify: poll API briefly to confirm generation was accepted
+    for _ in range(5):
+        time.sleep(3)
+        try:
+            status = client.get_overview_status(version_id)
+            if status and status.get("state"):
+                logger.debug(f"{paper_id}: generation confirmed (state={status['state']})")
+                return "ok"
+        except Exception:
+            pass
+
+    # Button was clicked but API didn't confirm -- still treat as triggered
+    logger.debug(f"{paper_id}: clicked but API status not confirmed")
+    return "ok"
+
+
+def trigger_overviews_batch(
+    papers: dict,          # {paper_id: version_id}
+    client,
+    secret_file: Optional[Path] = None,
+    headless: bool = True,
+    delay: float = 120.0,
+    on_progress=None,      # callback(paper_id, status: str)
+) -> dict:
+    """Trigger overview generation for multiple papers using a single browser.
+
+    Opens one Playwright persistent context, ensures login, then visits
+    each paper's overview page in sequence.  After clicking Generate,
+    verifies the trigger via the API before moving on.
+
+    Parameters
+    ----------
+    papers : dict
+        ``{paper_id: version_id}`` of papers to trigger.
+    client : AlphaXivClient
+        API client for verification polling.
+    secret_file : Path, optional
+        Path to SECRET.md for credential login fallback.
+    headless : bool
+        Run browser headless (default True).
+    delay : float
+        Seconds to wait between papers to avoid rate limits (default 60).
+    on_progress : callable, optional
+        Called as ``on_progress(paper_id, status)`` after each attempt.
+        *status* is ``"ok"``, ``"rate_limited"``, or ``"failed"``.
+
+    Returns
+    -------
+    dict
+        ``{paper_id: True/False}`` indicating which were triggered.
+    """
+    if not PLAYWRIGHT_AVAILABLE or not papers:
+        return {}
+
+    results = {}
+    rate_limit_backoff = 120  # extra seconds to wait on rate-limit
+
+    try:
+        with sync_playwright() as pw:
+            ctx = _launch_context(pw, headless=headless)
+            page = ctx.new_page()
+
+            # Verify login once
+            if not check_login(page):
+                logger.debug("Session invalid -- attempting credential login")
+                ctx.close()
+                if not _credential_login(secret_file=secret_file, headless=headless):
+                    logger.warning("Cannot log in -- aborting batch trigger")
+                    return {}
+                # Re-open context after credential login saved the session
+                ctx = _launch_context(pw, headless=headless)
+                page = ctx.new_page()
+
+            for i, (pid, vid) in enumerate(papers.items()):
+                if i > 0:
+                    time.sleep(delay)
+
+                status = _trigger_one_paper(page, pid, client, vid)
+
+                # On rate-limit: notify, back off, then retry once
+                if status == "rate_limited":
+                    if on_progress:
+                        on_progress(pid, "rate_limited")
+                    logger.info(
+                        f"{pid}: rate-limited, waiting {rate_limit_backoff}s before retry"
+                    )
+                    time.sleep(rate_limit_backoff)
+                    status = _trigger_one_paper(page, pid, client, vid)
+
+                results[pid] = (status == "ok")
+                if on_progress:
+                    on_progress(pid, status)
+
+            ctx.close()
+
+    except Exception as e:
+        logger.warning(f"trigger_overviews_batch failed: {e}")
+
+    return results
+
+
 def ensure_overview_generated(
     paper_id: str,
     version_id: str,
@@ -345,58 +527,20 @@ def ensure_overview_generated(
     secret_file: Optional[Path] = None,
     headless: bool = True,
 ) -> bool:
+    """Trigger overview generation for a single paper.
+
+    Convenience wrapper around ``trigger_overviews_batch`` for callers
+    that only need to trigger one paper.  For multiple papers, prefer
+    ``trigger_overviews_batch`` directly to reuse the browser context.
     """
-    Navigate to the paper's overview page and click the Generate button.
-    Triggers generation and returns immediately without waiting.
-
-    Login is attempted in order:
-      1. Saved browser session (from `axiv login`)
-      2. Credential login (from SECRET.md or env vars)
-
-    Returns True if the Generate button was clicked.
-    """
-    if not PLAYWRIGHT_AVAILABLE:
-        return False
-
-    # Try saved session first, fall back to credential login
-    if not is_session_valid():
-        logger.debug("No saved session -- attempting credential login")
-        if not _credential_login(secret_file=secret_file, headless=headless):
-            logger.warning(
-                "No valid session and credential login failed. "
-                "Run `axiv login` or provide SECRET.md / env vars."
-            )
-            return False
-
-    try:
-        with sync_playwright() as pw:
-            ctx = _launch_context(pw, headless=headless)
-            page = ctx.new_page()
-
-            page.goto(
-                f"{ALPHAXIV_WEB_URL}/overview/{paper_id}",
-                wait_until="networkidle",
-                timeout=30000,
-            )
-            page.wait_for_timeout(3_000)
-
-            for label in ("Generate", "generate", "Create overview", "Request"):
-                try:
-                    btn = page.locator(f'button:has-text("{label}")').first
-                    if btn.is_visible(timeout=20_000):
-                        btn.click()
-                        page.wait_for_timeout(2_000)
-                        ctx.close()
-                        return True
-                except Exception:
-                    pass
-
-            ctx.close()
-            return False
-
-    except Exception as e:
-        logger.debug(f"ensure_overview_generated failed: {e}")
-        return False
+    results = trigger_overviews_batch(
+        {paper_id: version_id},
+        client,
+        secret_file=secret_file,
+        headless=headless,
+        delay=0,
+    )
+    return results.get(paper_id, False)
 
 
 def is_playwright_available() -> bool:

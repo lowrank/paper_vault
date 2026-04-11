@@ -26,7 +26,7 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -101,7 +101,8 @@ CREATE TABLE IF NOT EXISTS tunnels (
     to_wing     TEXT NOT NULL,
     to_paper    TEXT NOT NULL,
     relation    TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    UNIQUE(from_wing, from_paper, to_wing, to_paper, relation)
 );
 
 CREATE TABLE IF NOT EXISTS synthesis (
@@ -320,7 +321,7 @@ def add_tunnel(
     try:
         conn = _connect(db_path)
         conn.execute(
-            "INSERT INTO tunnels (from_wing, from_paper, to_wing, to_paper, relation, created_at) "
+            "INSERT OR IGNORE INTO tunnels (from_wing, from_paper, to_wing, to_paper, relation, created_at) "
             "VALUES (?,?,?,?,?,?)",
             (from_wing, from_paper, to_wing, to_paper, relation, _now()),
         )
@@ -358,13 +359,10 @@ def upsert_to_chroma(
 ) -> None:
     """Store paper in ChromaDB with rich wing/hall/room metadata for filtered search."""
     try:
+        from alphaxiv_cli.client import extract_overview_text
         from mempalace.palace import get_collection  # type: ignore
 
-        text = (
-            (overview or {}).get("overview")
-            or (overview or {}).get("summary", {}).get("summary", "")
-            or info.get("abstract", "")
-        )
+        text = extract_overview_text(overview) or info.get("abstract", "")
         if not text:
             return
 
@@ -480,14 +478,14 @@ def clear_syntheses(wing_name: str, db_path: Path, keep_latest: bool = False) ->
     try:
         conn = _connect(db_path)
         if keep_latest:
-            conn.execute("""
+            cur = conn.execute("""
                 DELETE FROM synthesis WHERE wing_name=? AND id NOT IN (
                     SELECT id FROM synthesis WHERE wing_name=? ORDER BY created_at DESC LIMIT 1
                 )
             """, (wing_name, wing_name))
         else:
-            conn.execute("DELETE FROM synthesis WHERE wing_name=?", (wing_name,))
-        deleted = conn.total_changes
+            cur = conn.execute("DELETE FROM synthesis WHERE wing_name=?", (wing_name,))
+        deleted = cur.rowcount
         conn.commit()
         conn.close()
         return deleted
@@ -746,8 +744,10 @@ def remove_paper_from_wing(wing_name: str, paper_id: str, db_path: Path) -> bool
     """
     Remove a paper and all associated data from a wing.
 
-    Deletes from: rooms, drawers, closets, tunnels, note_links.
-    Also removes the paper's ChromaDB entry if possible.
+    Deletes from: rooms, drawers, closets, tunnels.
+    Note links (and the underlying note/report files on disk) are
+    intentionally preserved so the user keeps the generated overview
+    and report even after trimming the paper.
     Returns True if any rows were deleted, False otherwise.
     """
     try:
@@ -757,7 +757,6 @@ def remove_paper_from_wing(wing_name: str, paper_id: str, db_path: Path) -> bool
             ("rooms",      "wing_name=? AND paper_id=?"),
             ("drawers",    "wing_name=? AND paper_id=?"),
             ("closets",    "wing_name=? AND paper_id=?"),
-            ("note_links", "wing_name=? AND paper_id=?"),
         ]:
             cur = conn.execute(f"DELETE FROM {table} WHERE {clause}", (wing_name, paper_id))
             total += cur.rowcount
@@ -800,4 +799,4 @@ def remove_paper_from_chroma(wing_name: str, paper_id: str, palace_path: Path) -
 # ---------------------------------------------------------------------------
 
 def _now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")

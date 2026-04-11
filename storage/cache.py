@@ -4,7 +4,7 @@ import logging
 import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,10 @@ class Cache:
         try:
             data = json.loads(cache_path.read_text())
             cached_at = datetime.fromisoformat(data['cached_at'])
-            
-            if datetime.now() - cached_at > self.ttl:
+            # Ensure timezone-aware comparison (legacy entries may be naive)
+            if cached_at.tzinfo is None:
+                cached_at = cached_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - cached_at > self.ttl:
                 cache_path.unlink()
                 return None
             
@@ -54,7 +56,7 @@ class Cache:
         """Cache a value."""
         cache_path = self._get_cache_path(key)
         data = {
-            'cached_at': datetime.now().isoformat(),
+            'cached_at': datetime.now(timezone.utc).isoformat(),
             'value': value
         }
         cache_path.write_text(json.dumps(data))
@@ -89,7 +91,7 @@ class PaperDatabase:
         """Add paper to database."""
         self.db[paper_id] = {
             **metadata,
-            'processed_at': datetime.now().isoformat()
+            'processed_at': datetime.now(timezone.utc).isoformat()
         }
         self.save()
     
